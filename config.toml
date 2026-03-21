@@ -2,11 +2,12 @@
 # Each peer must run gorgon with the same port configured.
 # Add one [[peers]] entry per remote participant.
 
-bind_port = 9000
+bind_port   = 9000
+stream_port = 9001
 
 [[peers]]
-name = "alice"
-addr = "100.x.x.x:9000"   # replace with Tailscale IP
+name = "lizard"
+addr = "100.90.90.25:9000"   # replace with Tailscale IP
 
 # [[peers]]
 # name = "bob"

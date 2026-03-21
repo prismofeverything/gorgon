@@ -1,6 +1,10 @@
+mod audio;
 mod config;
+mod jitter;
 mod network;
 mod osc_msg;
+mod packet;
+mod stream;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -42,6 +46,21 @@ enum Command {
     Note {
         channel: String,
         midi_note: i32,
+    },
+
+    /// Stream raw PCM audio to/from all peers via the ES-9 (or any audio device)
+    Stream {
+        /// Input device name (substring match, default: system default)
+        #[arg(long)]
+        input_device: Option<String>,
+
+        /// Output device name (substring match, default: system default)
+        #[arg(long)]
+        output_device: Option<String>,
+
+        /// List available audio devices and exit
+        #[arg(long)]
+        list_devices: bool,
     },
 }
 
@@ -103,6 +122,15 @@ async fn main() -> anyhow::Result<()> {
             let packet = osc_msg::note(&channel, midi_note);
             network::broadcast(&socket, &peer_addrs, &packet).await;
             info!("sent /note/{channel} {midi_note}");
+        }
+
+        Command::Stream { input_device, output_device, list_devices } => {
+            if list_devices {
+                audio::list_devices()?;
+            } else {
+                info!("stream port: {}", cfg.stream_port);
+                stream::run(&cfg, input_device, output_device).await?;
+            }
         }
     }
 
