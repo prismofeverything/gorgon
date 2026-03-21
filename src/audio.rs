@@ -1,7 +1,8 @@
 use anyhow::{bail, Result};
+use libc;
 use cpal::{
     traits::{DeviceTrait, HostTrait},
-    Device, Stream, StreamConfig,
+    Device, SampleRate, Stream, StreamConfig,
 };
 use ringbuf::traits::{Consumer, Producer};
 use tracing::warn;
@@ -40,17 +41,95 @@ pub fn find_output_device(name: Option<&str>) -> Result<Device> {
     }
 }
 
+/// Highest channel count supported by the device for input.
+pub fn max_input_channels(device: &Device) -> Result<u16> {
+    device
+        .supported_input_configs()?
+        .map(|r| r.channels())
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("no supported input configs"))
+}
+
+/// Highest channel count supported by the device for output.
+pub fn max_output_channels(device: &Device) -> Result<u16> {
+    device
+        .supported_output_configs()?
+        .map(|r| r.channels())
+        .max()
+        .ok_or_else(|| anyhow::anyhow!("no supported output configs"))
+}
+
+/// Preferred sample rate: 48 kHz if the device supports it, otherwise the default.
+pub fn preferred_sample_rate(device: &Device) -> Result<u32> {
+    const TARGET: SampleRate = SampleRate(48_000);
+    for range in device.supported_input_configs()? {
+        if range.min_sample_rate() <= TARGET && TARGET <= range.max_sample_rate() {
+            return Ok(48_000);
+        }
+    }
+    Ok(device.default_input_config()?.sample_rate().0)
+}
+
 pub fn list_devices() -> Result<()> {
+    // ALSA writes probe errors directly to stderr via the C library.
+    // Suppress that fd during enumeration and restore it after.
+    let _guard = StderrSuppressor::new();
+
     let host = cpal::default_host();
-    println!("Input devices:");
+    let mut seen = std::collections::HashSet::new();
+
+    println!("Input:");
     for d in host.input_devices()? {
-        println!("  {}", d.name().unwrap_or_else(|_| "<unknown>".into()));
+        if let Ok(name) = d.name() {
+            if seen.insert(name.clone()) {
+                println!("  {name}");
+            }
+        }
     }
-    println!("Output devices:");
+
+    seen.clear();
+    println!("Output:");
     for d in host.output_devices()? {
-        println!("  {}", d.name().unwrap_or_else(|_| "<unknown>".into()));
+        if let Ok(name) = d.name() {
+            if seen.insert(name.clone()) {
+                println!("  {name}");
+            }
+        }
     }
+
     Ok(())
+}
+
+/// Redirects stderr (fd 2) to /dev/null for its lifetime, then restores it.
+struct StderrSuppressor {
+    saved_fd: libc::c_int,
+}
+
+impl StderrSuppressor {
+    fn new() -> Self {
+        let saved_fd = unsafe { libc::dup(2) };
+        let null_fd = unsafe {
+            libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_WRONLY)
+        };
+        if null_fd >= 0 {
+            unsafe {
+                libc::dup2(null_fd, 2);
+                libc::close(null_fd);
+            }
+        }
+        Self { saved_fd }
+    }
+}
+
+impl Drop for StderrSuppressor {
+    fn drop(&mut self) {
+        if self.saved_fd >= 0 {
+            unsafe {
+                libc::dup2(self.saved_fd, 2);
+                libc::close(self.saved_fd);
+            }
+        }
+    }
 }
 
 /// Build a cpal input stream that feeds captured f32 samples into `prod`.

@@ -58,6 +58,18 @@ enum Command {
         #[arg(long)]
         output_device: Option<String>,
 
+        /// Number of channels for both input and output (overridden by --input-channels / --output-channels)
+        #[arg(long)]
+        channels: Option<u16>,
+
+        /// Number of input channels to capture (default: device maximum)
+        #[arg(long)]
+        input_channels: Option<u16>,
+
+        /// Number of output channels to play back (default: device maximum)
+        #[arg(long)]
+        output_channels: Option<u16>,
+
         /// List available audio devices and exit
         #[arg(long)]
         list_devices: bool,
@@ -124,12 +136,14 @@ async fn main() -> anyhow::Result<()> {
             info!("sent /note/{channel} {midi_note}");
         }
 
-        Command::Stream { input_device, output_device, list_devices } => {
+        Command::Stream { input_device, output_device, channels, input_channels, output_channels, list_devices } => {
             if list_devices {
                 audio::list_devices()?;
             } else {
                 info!("stream port: {}", cfg.stream_port);
-                stream::run(&cfg, input_device, output_device).await?;
+                let in_ch  = input_channels.or(channels);
+                let out_ch = output_channels.or(channels);
+                stream::run(&cfg, input_device, output_device, in_ch, out_ch).await?;
             }
         }
     }

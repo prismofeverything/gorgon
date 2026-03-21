@@ -13,16 +13,16 @@ pub const SLOTS: usize = 64; // must be a power of two
 pub const PRIME_PACKETS: usize = 8; // packets to buffer before starting playout
 
 pub struct JitterBuffer {
-    slots:     Vec<Option<Vec<f32>>>,
-    read_seq:  u32,
-    filled:    usize,
+    slots:      Vec<Option<(Vec<f32>, u8)>>, // (samples, src_channels)
+    read_seq:   u32,
+    filled:     usize,
     pub primed: bool,
 }
 
 impl JitterBuffer {
     pub fn new() -> Self {
         Self {
-            slots:    (0..SLOTS).map(|_| None).collect(),
+            slots:    (0..SLOTS).map(|_| None::<(Vec<f32>, u8)>).collect(),
             read_seq: 0,
             filled:   0,
             primed:   false,
@@ -46,7 +46,7 @@ impl JitterBuffer {
         if self.slots[idx].is_none() {
             self.filled += 1;
         }
-        self.slots[idx] = Some(pkt.samples);
+        self.slots[idx] = Some((pkt.samples, pkt.channels));
 
         if !self.primed && self.filled >= PRIME_PACKETS {
             self.primed = true;
@@ -54,9 +54,9 @@ impl JitterBuffer {
     }
 
     /// Drain the next packet in sequence order.
-    /// Returns `Some(samples)` or `None` on loss (caller should write silence).
+    /// Returns `Some((samples, src_channels))` or `None` on loss (caller should write silence).
     /// Always advances the read pointer — call once per packet interval.
-    pub fn drain_next(&mut self) -> Option<Vec<f32>> {
+    pub fn drain_next(&mut self) -> Option<(Vec<f32>, u8)> {
         let idx = self.read_seq as usize % SLOTS;
         let result = self.slots[idx].take();
         if result.is_some() && self.filled > 0 {

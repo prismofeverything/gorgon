@@ -381,6 +381,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cpal",
+ "libc",
  "ringbuf",
  "rosc",
  "serde",
