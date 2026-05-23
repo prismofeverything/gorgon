@@ -1,1 +1,4 @@
 /target
+
+# Per-machine config — copy config.example.toml to config.toml and edit locally.
+/config.toml

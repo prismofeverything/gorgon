@@ -1,0 +1,43 @@
+# Gorgon config TEMPLATE.
+#
+# Copy this to config.toml and edit for YOUR machine:
+#     cp config.example.toml config.toml
+#
+# config.toml is gitignored — every machine keeps its own (different audio
+# device names, Tailscale IPs, peers, and routing), so it must not be shared
+# in git or you get merge conflicts. Only this template is tracked.
+
+bind_port   = 9000   # UDP port for OSC control messages
+stream_port = 9001   # UDP port for audio/CV streaming (must match on every machine)
+
+# --- Audio device -------------------------------------------------------------
+# Device names are substring-matched against `gorgon stream --list-devices`.
+#   Linux/ALSA: use "plughw:CARD=ES9" (ALSA converts to gorgon's f32/48k).
+#   macOS/CoreAudio: use "ES-9".
+[audio]
+input_device  = "plughw:CARD=ES9"   # macOS: "ES-9"
+output_device = "plughw:CARD=ES9"   # macOS: "ES-9"
+input_channels  = 14   # the 14 analogue inputs (idx 0..13)
+output_channels = 16   # MUST be 16 to reach the 1/8" outputs (idx 8..15)
+
+# ES-9 channel map (16 in / 16 out over USB; indices below are 0-based):
+#   INPUTS:   panel input jack N  ->  index N-1     (analogue inputs = idx 0..13)
+#   OUTPUTS:  panel 1/8" out  N   ->  index N+7     (modular outputs  = idx 8..15)
+#     output idx 0-1 = Main 1/4" L/R, 2-3 = headphone, 4-5 = S/PDIF, 6-7 = ES-5
+#   (Default map; the ES-9 config tool can reassign it — confirm if unsure.)
+
+# --- Peers --------------------------------------------------------------------
+# One [[peers]] block per remote participant. Routing is a two-sided contract:
+#   send = [..]          local INPUT indices to transmit, IN ORDER. send[0]
+#                        becomes packet channel 0, send[1] -> packet channel 1, ...
+#   recv = [[a, b], ..]  packet channel `a` (a position in THIS peer's send list)
+#                        -> local OUTPUT index `b`. Several may sum into one output.
+# Omit send/recv for a straight positional mapping.
+
+[[peers]]
+name = "friend"
+addr = "100.x.x.x:9000"        # peer's Tailscale IP (tailscale ip -4) + their bind_port
+# Send my input jacks 1-4 (idx 0-3) to this peer:
+send = [0, 1, 2, 3]
+# Put their first 4 sent channels onto my 1/8" outputs 1-4 (idx 8-11):
+recv = [[0, 8], [1, 9], [2, 10], [3, 11]]

@@ -15,7 +15,13 @@ cargo build --release
 
 ## Configuration
 
-Edit `config.toml`:
+Each machine keeps its own config — copy the template and edit it locally:
+
+```bash
+cp config.example.toml config.toml
+```
+
+`config.toml` is gitignored, so the two ends never conflict in git (only the `config.example.toml` template is tracked). A minimal config:
 
 ```toml
 bind_port   = 9000   # OSC port
