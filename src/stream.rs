@@ -1,8 +1,9 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{BufferSize, SampleRate, StreamConfig};
 use ringbuf::{HeapRb, traits::{Consumer, Observer, Producer, Split}};
@@ -21,6 +22,16 @@ const FRAMES_PER_PACKET: u8 = 64;
 /// Ring buffer capacity in frames — covers ~85 ms at 48 kHz.
 const RING_FRAMES: usize = 4096;
 
+/// A resolved per-peer audio route.
+#[derive(Clone)]
+struct Route {
+    name: String,
+    dest: SocketAddr,      // where to send our audio: peer ip + stream_port
+    ip:   IpAddr,          // source ip used to match incoming packets to this peer
+    send: Vec<u16>,        // local input channels to transmit, in order
+    recv: Vec<(u16, u16)>, // (incoming packet channel, local output channel)
+}
+
 pub async fn run(
     cfg: &Config,
     input_device:    Option<String>,
@@ -29,22 +40,81 @@ pub async fn run(
     out_channels_override: Option<u16>,
 ) -> Result<()> {
     // --- Devices and config -------------------------------------------------
+    // Precedence: CLI flag > [audio] config > device default/maximum.
 
-    let in_dev  = audio::find_input_device(input_device.as_deref())?;
-    let out_dev = audio::find_output_device(output_device.as_deref())?;
+    let in_name  = input_device.or_else(|| cfg.audio.input_device.clone());
+    let out_name = output_device.or_else(|| cfg.audio.output_device.clone());
+
+    // A cpal ALSA Device holds both a capture and a playback PCM handle for the
+    // device's whole lifetime. When input and output are the same device (e.g.
+    // both "ES9"), look it up once and reuse the handle for both streams —
+    // looking it up twice would fail, since the second open finds the PCM busy.
+    let (in_dev, out_dev) = if in_name.is_some() && in_name == out_name {
+        let dev = audio::find_input_device(in_name.as_deref())?;
+        (dev.clone(), dev)
+    } else {
+        (
+            audio::find_input_device(in_name.as_deref())?,
+            audio::find_output_device(out_name.as_deref())?,
+        )
+    };
 
     info!("input device:  {}", in_dev.name()?);
     info!("output device: {}", out_dev.name()?);
 
-    // Query each device independently for its maximum channel count.
-    let in_channels  = in_channels_override.unwrap_or(audio::max_input_channels(&in_dev)?);
-    let out_channels = out_channels_override.unwrap_or(audio::max_output_channels(&out_dev)?);
-    let sample_rate  = audio::preferred_sample_rate(&in_dev)?;
+    // Probe for the channel count only when it isn't pinned in config/CLI —
+    // `unwrap_or` would evaluate (and fail) the probe even when a value is set.
+    let in_channels = match in_channels_override.or(cfg.audio.input_channels) {
+        Some(c) => c,
+        None => audio::max_input_channels(&in_dev)?,
+    };
+    let out_channels = match out_channels_override.or(cfg.audio.output_channels) {
+        Some(c) => c,
+        None => audio::max_output_channels(&out_dev)?,
+    };
+    let sample_rate = audio::preferred_sample_rate(&in_dev)?;
 
     info!(
         "audio: {} Hz | in {} ch | out {} ch | {} frames/packet",
         sample_rate, in_channels, out_channels, FRAMES_PER_PACKET
     );
+
+    // --- Resolve per-peer routes -------------------------------------------
+
+    let routes: Vec<Route> = cfg
+        .peers
+        .iter()
+        .map(|p| Route {
+            name: p.name.clone(),
+            dest: SocketAddr::new(p.addr.ip(), cfg.stream_port),
+            ip:   p.addr.ip(),
+            send: p.send.clone().unwrap_or_else(|| (0..in_channels).collect()),
+            recv: p
+                .recv
+                .clone()
+                .unwrap_or_else(|| (0..out_channels).map(|i| (i, i)).collect()),
+        })
+        .collect();
+
+    // Validate route channel indices against the local device.
+    for r in &routes {
+        for &ch in &r.send {
+            if ch >= in_channels {
+                bail!("peer '{}': send channel {ch} exceeds input channels ({in_channels})", r.name);
+            }
+        }
+        for &(_pc, oc) in &r.recv {
+            if oc >= out_channels {
+                bail!("peer '{}': output channel {oc} exceeds output channels ({out_channels})", r.name);
+            }
+        }
+    }
+
+    for r in &routes {
+        info!("route {} ({}): send {:?} | recv {:?}", r.name, r.dest, r.send, r.recv);
+    }
+
+    // --- Stream configs -----------------------------------------------------
 
     let in_config = StreamConfig {
         channels:    in_channels,
@@ -76,73 +146,77 @@ pub async fn run(
     let socket    = Arc::new(UdpSocket::bind(bind_addr).await?);
     info!("stream socket bound to {bind_addr}");
 
-    let peers: Vec<SocketAddr> = cfg
-        .peers
-        .iter()
-        .map(|p| SocketAddr::new(p.addr.ip(), cfg.stream_port))
-        .collect();
-
-    info!(
-        "stream peers: {}",
-        peers.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
-    );
-
     // --- Send task ----------------------------------------------------------
+    //
+    // Each block of captured frames is re-interleaved into a per-peer packet
+    // containing only that peer's `send` channels, in the configured order.
 
     let send_socket  = Arc::clone(&socket);
-    let send_peers   = peers.clone();
+    let send_routes  = routes.clone();
     let frames       = FRAMES_PER_PACKET;
-    let in_n_samples = frames as usize * in_channels as usize;
+    let frames_usize = frames as usize;
+    let in_ch_usize  = in_channels as usize;
+    let in_n_samples = frames_usize * in_ch_usize;
 
     let send_task = tokio::spawn(async move {
-        let mut cap_cons  = cap_cons;
-        let mut seq: u32  = 0;
-        let mut frame_buf = vec![0f32; in_n_samples];
+        let mut cap_cons = cap_cons;
+        let mut seq: u32 = 0;
+        let mut block    = vec![0f32; in_n_samples];
 
         loop {
             while cap_cons.occupied_len() < in_n_samples {
                 tokio::task::yield_now().await;
             }
-
-            let popped = cap_cons.pop_slice(&mut frame_buf);
+            let popped = cap_cons.pop_slice(&mut block);
             if popped < in_n_samples {
                 continue;
             }
 
-            let pkt = AudioPacket {
-                seq,
-                sample_rate: sample_rate as u16,
-                channels: in_channels as u8,
-                frames,
-                samples: frame_buf.clone(),
-            };
-            let encoded = pkt.encode();
-            seq = seq.wrapping_add(1);
-
-            for peer in &send_peers {
-                if let Err(e) = send_socket.send_to(&encoded, peer).await {
-                    warn!("send → {peer}: {e}");
+            for route in &send_routes {
+                let n_ch = route.send.len();
+                let mut samples = Vec::with_capacity(frames_usize * n_ch);
+                for f in 0..frames_usize {
+                    let base = f * in_ch_usize;
+                    for &ch in &route.send {
+                        samples.push(block[base + ch as usize]);
+                    }
+                }
+                let pkt = AudioPacket {
+                    seq,
+                    sample_rate: sample_rate as u16,
+                    channels: n_ch as u8,
+                    frames,
+                    samples,
+                };
+                let encoded = pkt.encode();
+                if let Err(e) = send_socket.send_to(&encoded, route.dest).await {
+                    warn!("send → {} ({}): {e}", route.name, route.dest);
                 }
             }
+            seq = seq.wrapping_add(1);
         }
     });
 
     // --- Receive task -------------------------------------------------------
     //
-    // Receives packets from peers, inserts into the jitter buffer, and drains
-    // it into the playout ring on a timer.  Channel count mismatch between
-    // sender and local output is handled by adapt_channels().
+    // Each peer gets its own jitter buffer, keyed by source IP. On every drain
+    // tick all primed buffers are advanced and their routed channels summed
+    // into one output block — so several peers can land on the same output.
 
     let recv_socket    = Arc::clone(&socket);
+    let recv_routes    = routes.clone();
     let packet_dur_us  = (frames as u64 * 1_000_000) / sample_rate as u64;
-    let out_n_samples  = frames as usize * out_channels as usize;
-    let silence        = vec![0f32; out_n_samples];
-    // Allocate the recv buffer large enough for the biggest plausible packet.
-    let max_packet_len = AudioPacket::wire_len(frames, 32);
+    let out_ch_usize   = out_channels as usize;
+    let out_n_samples  = frames_usize * out_ch_usize;
+    let max_packet_len = AudioPacket::wire_len(frames, 64);
+
+    let ip_to_route: HashMap<IpAddr, usize> =
+        recv_routes.iter().enumerate().map(|(i, r)| (r.ip, i)).collect();
 
     let recv_task = tokio::spawn(async move {
-        let mut play_prod  = play_prod;
-        let mut jitter     = JitterBuffer::new();
+        let mut play_prod = play_prod;
+        let mut jitters: Vec<JitterBuffer> =
+            (0..recv_routes.len()).map(|_| JitterBuffer::new()).collect();
         let mut recv_buf   = vec![0u8; max_packet_len];
         let mut drain_tick = tokio::time::interval(Duration::from_micros(packet_dur_us));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -151,9 +225,11 @@ pub async fn run(
             tokio::select! {
                 result = recv_socket.recv_from(&mut recv_buf) => {
                     match result {
-                        Ok((len, _from)) => {
-                            if let Some(pkt) = AudioPacket::decode(&recv_buf[..len]) {
-                                jitter.insert(pkt);
+                        Ok((len, from)) => {
+                            if let Some(&ri) = ip_to_route.get(&from.ip()) {
+                                if let Some(pkt) = AudioPacket::decode(&recv_buf[..len]) {
+                                    jitters[ri].insert(pkt);
+                                }
                             }
                         }
                         Err(e) => warn!("recv error: {e}"),
@@ -161,18 +237,37 @@ pub async fn run(
                 }
 
                 _ = drain_tick.tick() => {
-                    if !jitter.primed {
+                    let mut out_block = vec![0f32; out_n_samples];
+                    let mut any = false;
+
+                    for (ri, route) in recv_routes.iter().enumerate() {
+                        let jb = &mut jitters[ri];
+                        if !jb.primed {
+                            continue;
+                        }
+                        any = true;
+                        if let Some((samples, src_ch)) = jb.drain_next() {
+                            let src_ch = src_ch as usize;
+                            for &(peer_ch, out_ch) in &route.recv {
+                                let pc = peer_ch as usize;
+                                let oc = out_ch as usize;
+                                if pc >= src_ch || oc >= out_ch_usize {
+                                    continue;
+                                }
+                                for f in 0..frames_usize {
+                                    out_block[f * out_ch_usize + oc] += samples[f * src_ch + pc];
+                                }
+                            }
+                        }
+                    }
+
+                    // Nothing primed yet — hold off so playout starts cleanly.
+                    if !any {
                         continue;
                     }
-                    let data: Vec<f32> = match jitter.drain_next() {
-                        Some((samples, src_ch)) => {
-                            adapt_channels(&samples, src_ch as usize, out_channels as usize, frames as usize)
-                        }
-                        None => silence.clone(),
-                    };
-                    let written = play_prod.push_slice(&data);
-                    if written < data.len() {
-                        warn!("playout ring full — dropped {} samples", data.len() - written);
+                    let written = play_prod.push_slice(&out_block);
+                    if written < out_block.len() {
+                        warn!("playout ring full — dropped {} samples", out_block.len() - written);
                     }
                 }
             }
@@ -189,19 +284,4 @@ pub async fn run(
     drop(output_stream);
 
     Ok(())
-}
-
-/// Adapt interleaved PCM from `src_ch` channels to `dst_ch` channels.
-/// Extra source channels are dropped; missing destination channels are silenced.
-fn adapt_channels(src: &[f32], src_ch: usize, dst_ch: usize, frames: usize) -> Vec<f32> {
-    if src_ch == dst_ch {
-        return src.to_vec();
-    }
-    let mut out = Vec::with_capacity(frames * dst_ch);
-    for frame in 0..frames {
-        for ch in 0..dst_ch {
-            out.push(if ch < src_ch { src[frame * src_ch + ch] } else { 0.0 });
-        }
-    }
-    out
 }

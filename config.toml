@@ -1,14 +1,32 @@
 # Gorgon config
-# Each peer must run gorgon with the same port configured.
+# Each peer must run gorgon with the same stream_port configured.
 # Add one [[peers]] entry per remote participant.
 
-bind_port   = 9000
-stream_port = 9001
+bind_port   = 9000   # UDP port for OSC control messages
+stream_port = 9001   # UDP port for audio/CV streaming (must match on every machine)
+
+# Local audio device. Names are substring-matched against `gorgon stream --list-devices`.
+# The Expert Sleepers ES-9 enumerates as "ES9" (no dash) on Linux/ALSA.
+# Channel counts default to the device maximum if omitted.
+[audio]
+# Use the "plughw" device so ALSA converts to the f32/48k format gorgon uses.
+# (The bare "hw:CARD=ES9" device wants the ES-9's exact native format.)
+input_device  = "plughw:CARD=ES9"
+output_device = "plughw:CARD=ES9"
+input_channels  = 14   # ES-9 inputs
+output_channels = 8    # ES-9 1/8" outputs
+
+# --- Peers --------------------------------------------------------------------
+# Per peer you can define a routing matrix:
+#   send = [..]           local INPUT channels (0-based) to transmit to this peer
+#   recv = [[a, b], ..]   each incoming channel `a` from this peer -> local OUTPUT `b`
+# Multiple incoming channels may sum into the same output.
+# Omit send/recv to fall back to a straight positional mapping.
 
 [[peers]]
 name = "lizard"
-addr = "100.90.90.25:9000"   # replace with Tailscale IP
-
-# [[peers]]
-# name = "bob"
-# addr = "100.y.y.y:9000"
+addr = "100.90.90.25:9000"     # peer's Tailscale IP + their bind_port
+# Send our ES-9 inputs 1-4 (indices 0-3) to lizard:
+send = [0, 1, 2, 3]
+# Place lizard's first four channels onto our ES-9 outputs 5-8 (indices 4-7):
+recv = [[0, 4], [1, 5], [2, 6], [3, 7]]

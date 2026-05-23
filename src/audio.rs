@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use libc;
 use cpal::{
     traits::{DeviceTrait, HostTrait},
@@ -13,14 +13,10 @@ pub fn find_input_device(name: Option<&str>) -> Result<Device> {
         None => host
             .default_input_device()
             .ok_or_else(|| anyhow::anyhow!("no default input device")),
-        Some(n) => {
-            for d in host.input_devices()? {
-                if d.name().map(|s| s.contains(n)).unwrap_or(false) {
-                    return Ok(d);
-                }
-            }
-            bail!("no input device matching '{n}'")
-        }
+        // Match against the unfiltered device list. The direction-filtered
+        // `input_devices()` probes each device, and on duplex interfaces like
+        // the ES-9 that probe can poison the later output lookup.
+        Some(n) => find_by_name(&host, n).ok_or_else(|| anyhow::anyhow!("no input device matching '{n}'")),
     }
 }
 
@@ -30,15 +26,41 @@ pub fn find_output_device(name: Option<&str>) -> Result<Device> {
         None => host
             .default_output_device()
             .ok_or_else(|| anyhow::anyhow!("no default output device")),
-        Some(n) => {
-            for d in host.output_devices()? {
-                if d.name().map(|s| s.contains(n)).unwrap_or(false) {
-                    return Ok(d);
-                }
-            }
-            bail!("no output device matching '{n}'")
-        }
+        Some(n) => find_by_name(&host, n).ok_or_else(|| anyhow::anyhow!("no output device matching '{n}'")),
     }
+}
+
+/// Find a device by name substring from the full (unfiltered) device list.
+///
+/// When several devices match (e.g. "ES9" matches both `hw:CARD=ES9` and
+/// `plughw:CARD=ES9`), prefer the `plughw:` variant: it converts to the f32/48k
+/// format gorgon uses, whereas the bare `hw:` device demands the interface's
+/// native format. An exact name match always wins, so a full ALSA name can
+/// still force a specific device.
+fn find_by_name(host: &cpal::Host, n: &str) -> Option<Device> {
+    // First pass: collect matching names without holding any handle open — a
+    // cpal ALSA Device keeps its PCMs open, and holding `hw:ES9` would make the
+    // card busy when we then try to open `plughw:ES9` (same hardware).
+    let names: Vec<String> = host
+        .devices()
+        .ok()?
+        .filter_map(|d| {
+            let name = d.name().ok()?;
+            name.contains(n).then_some(name)
+        })
+        .collect();
+
+    let chosen = names
+        .iter()
+        .find(|s| s.as_str() == n)
+        .or_else(|| names.iter().find(|s| s.starts_with("plughw:")))
+        .or_else(|| names.first())?
+        .clone();
+
+    // Second pass: open only the chosen device.
+    host.devices()
+        .ok()?
+        .find(|d| d.name().map(|s| s == chosen).unwrap_or(false))
 }
 
 /// Highest channel count supported by the device for input.
