@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -151,8 +152,16 @@ pub async fn run(
     // Each block of captured frames is re-interleaved into a per-peer packet
     // containing only that peer's `send` channels, in the configured order.
 
+    // Diagnostic counters, logged once a second by the stats task below.
+    let sent         = Arc::new(AtomicU64::new(0));
+    let recv_ok      = Arc::new(AtomicU64::new(0));
+    let recv_unknown = Arc::new(AtomicU64::new(0));
+    let recv_bad     = Arc::new(AtomicU64::new(0));
+    let resyncs      = Arc::new(AtomicU64::new(0));
+
     let send_socket  = Arc::clone(&socket);
     let send_routes  = routes.clone();
+    let send_sent    = Arc::clone(&sent);
     let frames       = FRAMES_PER_PACKET;
     let frames_usize = frames as usize;
     let in_ch_usize  = in_channels as usize;
@@ -191,6 +200,8 @@ pub async fn run(
                 let encoded = pkt.encode();
                 if let Err(e) = send_socket.send_to(&encoded, route.dest).await {
                     warn!("send → {} ({}): {e}", route.name, route.dest);
+                } else {
+                    send_sent.fetch_add(1, Ordering::Relaxed);
                 }
             }
             seq = seq.wrapping_add(1);
@@ -205,6 +216,10 @@ pub async fn run(
 
     let recv_socket    = Arc::clone(&socket);
     let recv_routes    = routes.clone();
+    let recv_ok_c      = Arc::clone(&recv_ok);
+    let recv_unknown_c = Arc::clone(&recv_unknown);
+    let recv_bad_c     = Arc::clone(&recv_bad);
+    let resyncs_c      = Arc::clone(&resyncs);
     let packet_dur_us  = (frames as u64 * 1_000_000) / sample_rate as u64;
     let out_ch_usize   = out_channels as usize;
     let out_n_samples  = frames_usize * out_ch_usize;
@@ -217,21 +232,36 @@ pub async fn run(
         let mut play_prod = play_prod;
         let mut jitters: Vec<JitterBuffer> =
             (0..recv_routes.len()).map(|_| JitterBuffer::new()).collect();
-        let mut recv_buf   = vec![0u8; max_packet_len];
-        let mut drain_tick = tokio::time::interval(Duration::from_micros(packet_dur_us));
+        let mut recv_buf     = vec![0u8; max_packet_len];
+        let mut unknown_seen: HashSet<IpAddr> = HashSet::new();
+        let mut drain_tick   = tokio::time::interval(Duration::from_micros(packet_dur_us));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 result = recv_socket.recv_from(&mut recv_buf) => {
                     match result {
-                        Ok((len, from)) => {
-                            if let Some(&ri) = ip_to_route.get(&from.ip()) {
-                                if let Some(pkt) = AudioPacket::decode(&recv_buf[..len]) {
-                                    jitters[ri].insert(pkt);
+                        Ok((len, from)) => match ip_to_route.get(&from.ip()) {
+                            Some(&ri) => match AudioPacket::decode(&recv_buf[..len]) {
+                                Some(pkt) => {
+                                    let was_primed = jitters[ri].primed;
+                                    if jitters[ri].insert(pkt) {
+                                        resyncs_c.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    if !was_primed && jitters[ri].primed {
+                                        info!("peer {} primed — playing out", recv_routes[ri].name);
+                                    }
+                                    recv_ok_c.fetch_add(1, Ordering::Relaxed);
+                                }
+                                None => { recv_bad_c.fetch_add(1, Ordering::Relaxed); }
+                            },
+                            None => {
+                                recv_unknown_c.fetch_add(1, Ordering::Relaxed);
+                                if unknown_seen.insert(from.ip()) {
+                                    warn!("audio from unconfigured source {} — set this exact IP as a peer addr to receive it", from.ip());
                                 }
                             }
-                        }
+                        },
                         Err(e) => warn!("recv error: {e}"),
                     }
                 }
@@ -274,11 +304,36 @@ pub async fn run(
         }
     });
 
+    // --- Stats task ---------------------------------------------------------
+    // Once a second, report packet counts so streaming problems are visible:
+    // sent stuck at 0 → not capturing; recv ok 0 with unknown > 0 → peer IP
+    // mismatch; recv all 0 → peer isn't sending / not reaching us.
+
+    let stats_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let (mut prev_sent, mut prev_ok) = (0u64, 0u64);
+        loop {
+            tick.tick().await;
+            let s  = sent.load(Ordering::Relaxed);
+            let ok = recv_ok.load(Ordering::Relaxed);
+            let un = recv_unknown.load(Ordering::Relaxed);
+            let bad = recv_bad.load(Ordering::Relaxed);
+            let rs = resyncs.load(Ordering::Relaxed);
+            info!(
+                "stats — sent {s} (+{}/s) | recv ok {ok} (+{}/s), unknown-src {un}, bad {bad}, resyncs {rs}",
+                s - prev_sent, ok - prev_ok
+            );
+            prev_sent = s;
+            prev_ok = ok;
+        }
+    });
+
     tokio::signal::ctrl_c().await?;
     info!("shutting down audio stream");
 
     send_task.abort();
     recv_task.abort();
+    stats_task.abort();
 
     drop(input_stream);
     drop(output_stream);

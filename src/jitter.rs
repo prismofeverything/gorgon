@@ -29,17 +29,27 @@ impl JitterBuffer {
         }
     }
 
-    /// Insert an incoming packet.  Drops packets that are too old or
-    /// too far ahead to fit in the window.
-    pub fn insert(&mut self, pkt: AudioPacket) {
+    /// Insert an incoming packet. Recent-but-late packets are dropped; a packet
+    /// that lands far outside the window in either direction means the streams
+    /// have desynced (a stall, loss burst, or the peer restarting) — resync to
+    /// it and re-prime rather than wedging forever. Returns `true` on resync.
+    pub fn insert(&mut self, pkt: AudioPacket) -> bool {
         // On the very first packet, anchor the read head.
         if self.filled == 0 && !self.primed {
             self.read_seq = pkt.seq;
         }
 
-        let distance = pkt.seq.wrapping_sub(self.read_seq);
-        if distance >= SLOTS as u32 {
-            return; // too old (already drained) or too far ahead
+        // `ahead` is pkt.seq - read_seq in wrapping (modular) arithmetic:
+        //   0..SLOTS                  -> inside the window, in the future
+        //   (MAX-SLOTS)..MAX          -> a few packets late (recent reorder)
+        //   anything else             -> way out of range -> desync
+        let ahead = pkt.seq.wrapping_sub(self.read_seq);
+        if ahead >= SLOTS as u32 {
+            if ahead > u32::MAX - SLOTS as u32 {
+                return false; // recently drained / reordered — just drop it
+            }
+            self.resync(pkt);
+            return true;
         }
 
         let idx = pkt.seq as usize % SLOTS;
@@ -51,6 +61,20 @@ impl JitterBuffer {
         if !self.primed && self.filled >= PRIME_PACKETS {
             self.primed = true;
         }
+        false
+    }
+
+    /// Discard buffered audio and re-anchor on `pkt`, then re-prime. Costs a
+    /// brief (~PRIME_PACKETS) silence but recovers a stuck stream automatically.
+    fn resync(&mut self, pkt: AudioPacket) {
+        for slot in &mut self.slots {
+            *slot = None;
+        }
+        self.read_seq = pkt.seq;
+        let idx = pkt.seq as usize % SLOTS;
+        self.slots[idx] = Some((pkt.samples, pkt.channels));
+        self.filled = 1;
+        self.primed = false;
     }
 
     /// Drain the next packet in sequence order.
@@ -64,5 +88,58 @@ impl JitterBuffer {
         }
         self.read_seq = self.read_seq.wrapping_add(1);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkt(seq: u32) -> AudioPacket {
+        AudioPacket { seq, sample_rate: 48_000, channels: 1, frames: 1, samples: vec![seq as f32] }
+    }
+
+    #[test]
+    fn primes_after_prime_packets() {
+        let mut jb = JitterBuffer::new();
+        for s in 0..PRIME_PACKETS as u32 {
+            assert!(!jb.insert(pkt(s)), "in-window insert must not resync");
+        }
+        assert!(jb.primed);
+    }
+
+    #[test]
+    fn recent_late_packet_is_dropped_not_resynced() {
+        let mut jb = JitterBuffer::new();
+        for s in 0..PRIME_PACKETS as u32 {
+            jb.insert(pkt(s));
+        }
+        for _ in 0..3 {
+            jb.drain_next(); // advance read_seq to 3
+        }
+        // seq 0 is now behind the read head — stale reorder, drop without resync
+        assert!(!jb.insert(pkt(0)));
+    }
+
+    #[test]
+    fn large_forward_jump_resyncs_and_recovers() {
+        let mut jb = JitterBuffer::new();
+        for s in 0..PRIME_PACKETS as u32 {
+            jb.insert(pkt(s));
+        }
+        assert!(jb.primed);
+
+        // Sender raced far ahead (stall / restart) — the old code would wedge here.
+        let jump = 10_000u32;
+        assert!(jb.insert(pkt(jump)), "far-ahead packet should resync");
+        assert!(!jb.primed, "resync re-primes from scratch");
+
+        // Fill the cushion at the new sequence and confirm playout resumes in order.
+        for s in (jump + 1)..(jump + PRIME_PACKETS as u32) {
+            jb.insert(pkt(s));
+        }
+        assert!(jb.primed);
+        let (samples, _) = jb.drain_next().expect("resynced stream should drain");
+        assert_eq!(samples[0], jump as f32, "drains from the resynced sequence");
     }
 }
