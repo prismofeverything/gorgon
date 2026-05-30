@@ -15,6 +15,7 @@ use crate::audio;
 use crate::config::Config;
 use crate::jitter::JitterBuffer;
 use crate::packet::AudioPacket;
+use crate::transport;
 
 /// Number of audio frames packed into each UDP packet.
 /// 64 frames @ 48 kHz = ~1.33 ms per packet.
@@ -182,21 +183,9 @@ pub async fn run(
             }
 
             for route in &send_routes {
-                let n_ch = route.send.len();
-                let mut samples = Vec::with_capacity(frames_usize * n_ch);
-                for f in 0..frames_usize {
-                    let base = f * in_ch_usize;
-                    for &ch in &route.send {
-                        samples.push(block[base + ch as usize]);
-                    }
-                }
-                let pkt = AudioPacket {
-                    seq,
-                    sample_rate: sample_rate as u16,
-                    channels: n_ch as u8,
-                    frames,
-                    samples,
-                };
+                let pkt = transport::packetize(
+                    &block, in_ch_usize, &route.send, frames, seq, sample_rate as u16,
+                );
                 let encoded = pkt.encode();
                 if let Err(e) = send_socket.send_to(&encoded, route.dest).await {
                     warn!("send → {} ({}): {e}", route.name, route.dest);
@@ -244,11 +233,11 @@ pub async fn run(
                         Ok((len, from)) => match ip_to_route.get(&from.ip()) {
                             Some(&ri) => match AudioPacket::decode(&recv_buf[..len]) {
                                 Some(pkt) => {
-                                    let was_primed = jitters[ri].primed;
-                                    if jitters[ri].insert(pkt) {
+                                    let out = transport::ingest(&mut jitters[ri], pkt);
+                                    if out.resynced {
                                         resyncs_c.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    if !was_primed && jitters[ri].primed {
+                                    if out.newly_primed {
                                         info!("peer {} primed — playing out", recv_routes[ri].name);
                                     }
                                     recv_ok_c.fetch_add(1, Ordering::Relaxed);

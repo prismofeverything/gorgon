@@ -19,3 +19,11 @@ anyhow = "1"
 cpal = "0.15"
 ringbuf = "0.4"
 libc = "0.2"
+
+# Linux-only: create native virtual audio devices via PipeWire.
+# Links the system libpipewire-0.3; the v0_3_* feature gate must not exceed the
+# installed library (1.0.7 here). bytemuck reinterprets the mapped byte buffer
+# as f32 in the real-time process callback.
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { version = "0.8", features = ["v0_3_65"] }
+bytemuck = "1"

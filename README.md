@@ -1,6 +1,6 @@
 # gorgon
 
-P2P audio and CV messenger over Tailscale. Send raw PCM audio between two ES-9 interfaces, or exchange OSC control-voltage messages, with no central server.
+P2P audio and CV messenger over Tailscale. Send raw PCM audio between two ES-9 interfaces, or exchange OSC control-voltage messages, with no central server. Or join a **group** and have each member's exposed signals appear as a native virtual audio device on everyone else's machine — see [Remote groups](#remote-groups).
 
 ## Requirements
 
@@ -106,6 +106,39 @@ gorgon note bass 60
 ```
 
 OSC messages use the address scheme `/cv/<channel>`, `/gate/<channel>`, `/note/<channel>` and are compatible with VCV Rack's **cvosccv** module. Point cvosccv's output at your peer's Tailscale IP on port 9000.
+
+### Remote groups
+
+Instead of hand-wiring channel matrices, you can declare *named* signals and join a *group*. Every other member then shows up on your machine as a native virtual audio device — selectable in your DAW, VCV Rack, or any app.
+
+```toml
+device_name = "ryan-es9"     # how you appear as a device to others
+
+[[remote.outputs]]           # signals you send (sourced from your input jacks)
+name = "kick"
+channel = 0
+[[remote.outputs]]
+name = "bass"
+channel = 1
+
+[groups.modular-jam]         # static roster of member Tailscale IPs (list the others)
+members = ["100.x.x.x", "100.y.y.y"]
+```
+
+```bash
+gorgon remote modular-jam
+```
+
+Each machine broadcasts its device name and port list to the group every ~1.5 s, so members learn each other's layout automatically (and a member who restarts with a changed config is picked up within seconds). A peer named `alice-es9` exposing two outputs appears on your machine as a 2-channel recordable device `alice-es9`.
+
+**Platform support for the virtual device:**
+
+- **Linux** — created natively via PipeWire, no setup beyond `libpipewire-0.3-dev` at build time. Channels show as `AUX0, AUX1, …` in other apps; gorgon owns the real names and prints the `AUXn = name` mapping at startup.
+- **macOS** — gorgon binds to a pre-installed [BlackHole](https://existential.audio/blackhole/) device (set `input_device`/`output_device` to e.g. `"BlackHole 16ch"`). To monitor it alongside real I/O, make an Aggregate Device in Audio MIDI Setup. *(macOS binding lands in a later phase; Linux↔Linux works today.)*
+
+Because signals stay raw f32 PCM with PipeWire conversion/volume/mixing disabled, DC-coupled CV passes through the virtual device bit-for-bit, exactly like the direct `stream` path.
+
+> **Status:** the first cut sends your exposed **outputs** and presents peers' outputs as devices. Exposed **inputs** (peers playing *into* your device), 3+ way summing, and the macOS/BlackHole binding are landing incrementally.
 
 ## Latency
 

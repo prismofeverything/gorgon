@@ -7,8 +7,12 @@
 # device names, Tailscale IPs, peers, and routing), so it must not be shared
 # in git or you get merge conflicts. Only this template is tracked.
 
-bind_port   = 9000   # UDP port for OSC control messages
+bind_port   = 9000   # UDP port for OSC control messages + group advertisements
 stream_port = 9001   # UDP port for audio/CV streaming (must match on every machine)
+
+# How THIS machine appears as a virtual audio device on other members of a group
+# (used by the `remote` command). Defaults to the hostname when omitted.
+device_name = "my-rig"
 
 # --- Audio device -------------------------------------------------------------
 # Device names are substring-matched against `gorgon stream --list-devices`.
@@ -41,3 +45,39 @@ addr = "100.x.x.x:9000"        # peer's Tailscale IP (tailscale ip -4) + their b
 send = [0, 1, 2, 3]
 # Put their first 4 sent channels onto my 1/8" outputs 1-4 (idx 8-11):
 recv = [[0, 8], [1, 9], [2, 10], [3, 11]]
+
+# --- Remote groups ------------------------------------------------------------
+# `gorgon remote <group>` exposes named signals to a group and makes every other
+# member show up as a native virtual audio device: PipeWire on Linux, a
+# pre-installed BlackHole device on macOS. On Linux the device's channels appear
+# as AUX0, AUX1, … in your DAW/VCV — gorgon prints the "AUXn = name" mapping at
+# startup, so the human names live in gorgon rather than in the OS.
+#
+# OUTPUTS: signals you SEND. Each is sourced from one of your physical INPUT
+# channels and becomes a capture channel on your device on every peer. Their
+# order here is the channel order (the first output is AUX0, and so on).
+[[remote.outputs]]
+name    = "kick"
+channel = 0          # sourced from your physical input channel 0
+[[remote.outputs]]
+name    = "bass"
+channel = 1
+
+# INPUTS: signals you ACCEPT. When a peer plays into your device on their
+# machine, the audio lands on one of your physical OUTPUT channels.
+# (Parsed now; wired up in the bidirectional phase — listed here for shape.)
+[[remote.inputs]]
+name    = "return_l"
+channel = 8          # lands on your physical output channel 8
+[[remote.inputs]]
+name    = "return_r"
+channel = 9
+
+# A group is a static roster of member Tailscale IPs (find yours with
+# `tailscale ip -4`); list the OTHER members. Join with the section name:
+#     gorgon remote modular-jam
+[groups.modular-jam]
+members = [
+  "100.x.x.x",   # alice
+  "100.y.y.y",   # bob
+]

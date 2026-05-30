@@ -4,7 +4,10 @@ mod jitter;
 mod network;
 mod osc_msg;
 mod packet;
+mod remote;
 mod stream;
+mod transport;
+mod vdev;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -73,6 +76,13 @@ enum Command {
         /// List available audio devices and exit
         #[arg(long)]
         list_devices: bool,
+    },
+
+    /// Join a group: expose your configured signals and present each peer's
+    /// signals as a native virtual audio device
+    Remote {
+        /// Group to join — a `[groups.<name>]` section in the config
+        group: String,
     },
 }
 
@@ -145,6 +155,10 @@ async fn main() -> anyhow::Result<()> {
                 let out_ch = output_channels.or(channels);
                 stream::run(&cfg, input_device, output_device, in_ch, out_ch).await?;
             }
+        }
+
+        Command::Remote { group } => {
+            remote::run(&cfg, &group, Arc::clone(&socket)).await?;
         }
     }
 
