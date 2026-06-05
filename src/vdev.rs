@@ -175,9 +175,10 @@ mod linux {
             move |_| ml.quit()
         });
 
+        let node_name = format!("{name}.capture");
         let stream = setup_try!(
             ready_tx,
-            pw::stream::Stream::new(&core, &name, node_properties(&name, "Audio/Source"))
+            pw::stream::Stream::new(&core, &node_name, node_properties(&node_name, &name, "Audio/Source"))
         );
 
         let chans = channels as usize;
@@ -233,9 +234,10 @@ mod linux {
             move |_| ml.quit()
         });
 
+        let node_name = format!("{name}.playback");
         let stream = setup_try!(
             ready_tx,
-            pw::stream::Stream::new(&core, &name, node_properties(&name, "Audio/Sink"))
+            pw::stream::Stream::new(&core, &node_name, node_properties(&node_name, &name, "Audio/Sink"))
         );
 
         let _listener = setup_try!(
@@ -301,12 +303,15 @@ mod linux {
     /// Node properties: identity plus the settings that keep DC-coupled CV
     /// bit-exact (forced 48 kHz f32, no channel mixing, no monitor volume).
     /// All keys are plain strings — `Properties::insert` takes `Into<Vec<u8>>`.
-    fn node_properties(name: &str, media_class: &str) -> pw::properties::Properties {
+    fn node_properties(node_name: &str, description: &str, media_class: &str) -> pw::properties::Properties {
         let mut p = pw::properties::Properties::new();
         p.insert("media.type", "Audio");
         p.insert("media.class", media_class);
-        p.insert("node.name", name);
-        p.insert("node.description", name);
+        // node.name is the unique graph id; node.description is the display name.
+        // A peer's source and sink share a description (their device name) but
+        // differ in node.name, so each shows up cleanly in its direction's list.
+        p.insert("node.name", node_name);
+        p.insert("node.description", description);
         p.insert("node.virtual", "true");
         p.insert("audio.rate", "48000");
         p.insert("audio.format", "F32");
@@ -354,24 +359,32 @@ mod tests {
     /// box with a PipeWire server:
     ///   `cargo test creates_a_visible_source_node -- --ignored --nocapture`
     #[test]
-    #[ignore = "spawns a real PipeWire node; needs a running PipeWire server"]
-    fn creates_a_visible_source_node() {
-        let (_prod, cons) = HeapRb::<f32>::new(4096).split();
-        // `source` only returns Ok after PipeWire accepts and publishes the node.
-        let dev = source("gorgon-selftest", 2, cons).expect("source node should connect");
+    #[ignore = "spawns real PipeWire nodes; needs a running PipeWire server"]
+    fn creates_visible_source_and_sink_nodes() {
+        // `source`/`sink` only return Ok after PipeWire accepts and publishes the
+        // node, so these `expect`s already prove both directions connect.
+        let (_p, cons) = HeapRb::<f32>::new(4096).split();
+        let src = source("gorgon-selftest", 2, cons).expect("source node should connect");
+        let (prod, _c) = HeapRb::<f32>::new(4096).split();
+        let snk = sink("gorgon-selftest", 2, prod).expect("sink node should connect");
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         match std::process::Command::new("pw-cli").args(["ls", "Node"]).output() {
             Ok(o) => {
                 let listing = String::from_utf8_lossy(&o.stdout);
                 assert!(
-                    listing.contains("gorgon-selftest"),
-                    "node 'gorgon-selftest' not found in `pw-cli ls Node`"
+                    listing.contains("gorgon-selftest.capture"),
+                    "source node 'gorgon-selftest.capture' not found in `pw-cli ls Node`"
                 );
-                eprintln!("ok: virtual node 'gorgon-selftest' is live in the PipeWire graph");
+                assert!(
+                    listing.contains("gorgon-selftest.playback"),
+                    "sink node 'gorgon-selftest.playback' not found in `pw-cli ls Node`"
+                );
+                eprintln!("ok: both virtual nodes are live in the PipeWire graph");
             }
-            Err(e) => eprintln!("(pw-cli unavailable: {e}) — source() returning Ok already implies connect succeeded"),
+            Err(e) => eprintln!("(pw-cli unavailable: {e}) — Ok returns already imply connect succeeded"),
         }
-        drop(dev);
+        drop(src);
+        drop(snk);
     }
 }

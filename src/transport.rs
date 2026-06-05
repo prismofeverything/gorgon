@@ -52,3 +52,26 @@ pub fn ingest(jb: &mut JitterBuffer, pkt: AudioPacket) -> IngestOutcome {
         newly_primed: !was_primed && jb.primed,
     }
 }
+
+/// Add one drained packet's routed channels into an interleaved output block.
+/// `recv_pairs` maps `(packet_channel, local_output_channel)`; several pairs may
+/// target the same output, in which case they sum (so multiple peers mix onto
+/// one physical output). Out-of-range channels are skipped.
+pub fn sum_into_output(
+    out_block: &mut [f32],
+    samples: &[f32],
+    src_channels: usize,
+    out_channels: usize,
+    recv_pairs: &[(u16, u16)],
+    frames: usize,
+) {
+    for &(pc, oc) in recv_pairs {
+        let (pc, oc) = (pc as usize, oc as usize);
+        if pc >= src_channels || oc >= out_channels {
+            continue;
+        }
+        for f in 0..frames {
+            out_block[f * out_channels + oc] += samples[f * src_channels + pc];
+        }
+    }
+}

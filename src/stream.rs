@@ -266,17 +266,14 @@ pub async fn run(
                         }
                         any = true;
                         if let Some((samples, src_ch)) = jb.drain_next() {
-                            let src_ch = src_ch as usize;
-                            for &(peer_ch, out_ch) in &route.recv {
-                                let pc = peer_ch as usize;
-                                let oc = out_ch as usize;
-                                if pc >= src_ch || oc >= out_ch_usize {
-                                    continue;
-                                }
-                                for f in 0..frames_usize {
-                                    out_block[f * out_ch_usize + oc] += samples[f * src_ch + pc];
-                                }
-                            }
+                            transport::sum_into_output(
+                                &mut out_block,
+                                &samples,
+                                src_ch as usize,
+                                out_ch_usize,
+                                &route.recv,
+                                frames_usize,
+                            );
                         }
                     }
 

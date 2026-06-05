@@ -134,11 +134,13 @@ Each machine broadcasts its device name and port list to the group every ~1.5 s,
 **Platform support for the virtual device:**
 
 - **Linux** — created natively via PipeWire, no setup beyond `libpipewire-0.3-dev` at build time. Channels show as `AUX0, AUX1, …` in other apps; gorgon owns the real names and prints the `AUXn = name` mapping at startup.
-- **macOS** — gorgon binds to a pre-installed [BlackHole](https://existential.audio/blackhole/) device (set `input_device`/`output_device` to e.g. `"BlackHole 16ch"`). To monitor it alongside real I/O, make an Aggregate Device in Audio MIDI Setup. *(macOS binding lands in a later phase; Linux↔Linux works today.)*
+- **macOS** — gorgon binds to a pre-installed [BlackHole](https://existential.audio/blackhole/) device (install the 16-channel build; override the name with `[audio] mac_device = "BlackHole 16ch"` if needed). Since macOS can't mint a device per peer, gorgon multiplexes the whole group onto BlackHole's channels and **prints a channel map at startup** — e.g. "RECORD their outputs on BlackHole ch 0..2", "PLAY your outputs into BlackHole ch 8..10". You wire your DAW/VCV to those channels (record the low half, play into the high half — the two halves are kept separate so the loopback doesn't feed back). To use it alongside real hardware, make an Aggregate Device in Audio MIDI Setup. *(This path is new and verified to compile + unit-tested on Linux, but the live CoreAudio behavior should be confirmed on a Mac.)*
+
+`[[remote.inputs]]` close the loop: a peer playing into your device on their machine arrives and is summed onto your physical output channels (several peers mix). Any number of members can be in a group at once — each appears as its own device, and everyone's audio mixes where it overlaps.
 
 Because signals stay raw f32 PCM with PipeWire conversion/volume/mixing disabled, DC-coupled CV passes through the virtual device bit-for-bit, exactly like the direct `stream` path.
 
-> **Status:** the first cut sends your exposed **outputs** and presents peers' outputs as devices. Exposed **inputs** (peers playing *into* your device), 3+ way summing, and the macOS/BlackHole binding are landing incrementally.
+> **Status:** Full-duplex with any number of members. Linux uses native PipeWire devices (per peer). macOS uses one BlackHole device with a printed channel map (new — pending live verification on a Mac). Still landing: automatic reconfiguration when you re-save your config (for now, restarting re-announces your layout).
 
 ## Latency
 

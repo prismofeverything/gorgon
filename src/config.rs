@@ -44,6 +44,9 @@ pub struct Audio {
     pub input_channels: Option<u16>,
     /// Number of output channels to open (default: device maximum).
     pub output_channels: Option<u16>,
+    /// macOS only: the BlackHole device the `remote` command multiplexes the
+    /// group onto (substring match). Defaults to "BlackHole" when omitted.
+    pub mac_device: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
