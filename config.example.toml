@@ -19,6 +19,9 @@ input_device  = "plughw:CARD=ES9"   # macOS: "ES-9"
 output_device = "plughw:CARD=ES9"   # macOS: "ES-9"
 input_channels  = 14   # the 14 analogue inputs (idx 0..13)
 output_channels = 16   # MUST be 16 to reach the 1/8" outputs (idx 8..15)
+# Playout buffer depth in ms — the latency vs. stability knob. Raise it (e.g. 80)
+# if you hear glitches/dropouts; lower it (e.g. 20) for tighter timing once stable.
+jitter_ms = 40
 
 # ES-9 channel map (16 in / 16 out over USB; indices below are 0-based):
 #   INPUTS:   panel input jack N  ->  index N-1     (analogue inputs = idx 0..13)

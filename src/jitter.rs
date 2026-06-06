@@ -9,22 +9,26 @@
 
 use crate::packet::AudioPacket;
 
-pub const SLOTS: usize = 64; // must be a power of two
-pub const PRIME_PACKETS: usize = 8; // packets to buffer before starting playout
+pub const SLOTS: usize = 256; // must be a power of two; window ≈ 340 ms at 64-frame packets
 
 pub struct JitterBuffer {
     slots:      Vec<Option<(Vec<f32>, u8)>>, // (samples, src_channels)
     read_seq:   u32,
     filled:     usize,
+    prime:      usize, // packets to buffer before playout starts
     pub primed: bool,
 }
 
 impl JitterBuffer {
-    pub fn new() -> Self {
+    /// `prime` is how many packets to buffer before playout begins — the
+    /// playout latency cushion, in packets.
+    pub fn new(prime: usize) -> Self {
+        let prime = prime.clamp(1, SLOTS / 2);
         Self {
             slots:    (0..SLOTS).map(|_| None::<(Vec<f32>, u8)>).collect(),
             read_seq: 0,
             filled:   0,
+            prime,
             primed:   false,
         }
     }
@@ -58,7 +62,7 @@ impl JitterBuffer {
         }
         self.slots[idx] = Some((pkt.samples, pkt.channels));
 
-        if !self.primed && self.filled >= PRIME_PACKETS {
+        if !self.primed && self.filled >= self.prime {
             self.primed = true;
         }
         false
@@ -95,14 +99,16 @@ impl JitterBuffer {
 mod tests {
     use super::*;
 
+    const PRIME: u32 = 8;
+
     fn pkt(seq: u32) -> AudioPacket {
         AudioPacket { seq, sample_rate: 48_000, channels: 1, frames: 1, samples: vec![seq as f32] }
     }
 
     #[test]
     fn primes_after_prime_packets() {
-        let mut jb = JitterBuffer::new();
-        for s in 0..PRIME_PACKETS as u32 {
+        let mut jb = JitterBuffer::new(PRIME as usize);
+        for s in 0..PRIME {
             assert!(!jb.insert(pkt(s)), "in-window insert must not resync");
         }
         assert!(jb.primed);
@@ -110,8 +116,8 @@ mod tests {
 
     #[test]
     fn recent_late_packet_is_dropped_not_resynced() {
-        let mut jb = JitterBuffer::new();
-        for s in 0..PRIME_PACKETS as u32 {
+        let mut jb = JitterBuffer::new(PRIME as usize);
+        for s in 0..PRIME {
             jb.insert(pkt(s));
         }
         for _ in 0..3 {
@@ -123,8 +129,8 @@ mod tests {
 
     #[test]
     fn large_forward_jump_resyncs_and_recovers() {
-        let mut jb = JitterBuffer::new();
-        for s in 0..PRIME_PACKETS as u32 {
+        let mut jb = JitterBuffer::new(PRIME as usize);
+        for s in 0..PRIME {
             jb.insert(pkt(s));
         }
         assert!(jb.primed);
@@ -135,7 +141,7 @@ mod tests {
         assert!(!jb.primed, "resync re-primes from scratch");
 
         // Fill the cushion at the new sequence and confirm playout resumes in order.
-        for s in (jump + 1)..(jump + PRIME_PACKETS as u32) {
+        for s in (jump + 1)..(jump + PRIME) {
             jb.insert(pkt(s));
         }
         assert!(jb.primed);

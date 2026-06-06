@@ -27,6 +27,9 @@ pub struct Audio {
     pub input_channels: Option<u16>,
     /// Number of output channels to open (default: device maximum).
     pub output_channels: Option<u16>,
+    /// Playout buffer depth in milliseconds — how much audio to hold before
+    /// playing, trading latency for resilience to network jitter (default: 40).
+    pub jitter_ms: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

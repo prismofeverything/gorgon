@@ -20,8 +20,18 @@ use crate::packet::AudioPacket;
 /// 64 frames @ 48 kHz = ~1.33 ms per packet.
 const FRAMES_PER_PACKET: u8 = 64;
 
-/// Ring buffer capacity in frames — covers ~85 ms at 48 kHz.
-const RING_FRAMES: usize = 4096;
+/// Playout ring capacity in frames — covers ~170 ms at 48 kHz. Generous so the
+/// configurable target fill level (see `jitter_ms`) always fits.
+const RING_FRAMES: usize = 8192;
+
+/// Default playout buffer depth (ms) if not set in config.
+const DEFAULT_JITTER_MS: u16 = 40;
+
+/// On a missing packet, repeat the last block this many times (fading) before
+/// falling back to silence — masks isolated losses without obvious looping.
+const PLC_MAX_REPEATS: u32 = 3;
+/// Per-repeat amplitude decay applied during packet-loss concealment.
+const PLC_DECAY: f32 = 0.6;
 
 /// A resolved per-peer audio route.
 #[derive(Clone)]
@@ -75,9 +85,17 @@ pub async fn run(
     };
     let sample_rate = audio::preferred_sample_rate(&in_dev)?;
 
+    // Playout buffer depth: how much audio we hold before playing. This is the
+    // latency/stability trade-off knob. Express it both as a packet count (the
+    // jitter-buffer prime) and as a frame target the drain loop keeps queued.
+    let jitter_ms = cfg.audio.jitter_ms.unwrap_or(DEFAULT_JITTER_MS).max(5);
+    let target_frames = (jitter_ms as usize * sample_rate as usize / 1000)
+        .min(RING_FRAMES - FRAMES_PER_PACKET as usize); // leave room for one block
+    let prime_packets = (target_frames / FRAMES_PER_PACKET as usize).max(1);
+
     info!(
-        "audio: {} Hz | in {} ch | out {} ch | {} frames/packet",
-        sample_rate, in_channels, out_channels, FRAMES_PER_PACKET
+        "audio: {} Hz | in {} ch | out {} ch | {} frames/packet | playout buffer {} ms (~{} packets)",
+        sample_rate, in_channels, out_channels, FRAMES_PER_PACKET, jitter_ms, prime_packets
     );
 
     // --- Resolve per-peer routes -------------------------------------------
@@ -158,6 +176,7 @@ pub async fn run(
     let recv_unknown = Arc::new(AtomicU64::new(0));
     let recv_bad     = Arc::new(AtomicU64::new(0));
     let resyncs      = Arc::new(AtomicU64::new(0));
+    let plc          = Arc::new(AtomicU64::new(0));
 
     let send_socket  = Arc::clone(&socket);
     let send_routes  = routes.clone();
@@ -220,9 +239,12 @@ pub async fn run(
     let recv_unknown_c = Arc::clone(&recv_unknown);
     let recv_bad_c     = Arc::clone(&recv_bad);
     let resyncs_c      = Arc::clone(&resyncs);
-    let packet_dur_us  = (frames as u64 * 1_000_000) / sample_rate as u64;
+    let plc_c          = Arc::clone(&plc);
     let out_ch_usize   = out_channels as usize;
     let out_n_samples  = frames_usize * out_ch_usize;
+    let packet_dur_us  = (frames as u64 * 1_000_000) / sample_rate as u64;
+    let play_capacity  = RING_FRAMES * out_ch_usize;
+    let target_samples = target_frames * out_ch_usize;
     let max_packet_len = AudioPacket::wire_len(frames, 64);
 
     let ip_to_route: HashMap<IpAddr, usize> =
@@ -231,10 +253,15 @@ pub async fn run(
     let recv_task = tokio::spawn(async move {
         let mut play_prod = play_prod;
         let mut jitters: Vec<JitterBuffer> =
-            (0..recv_routes.len()).map(|_| JitterBuffer::new()).collect();
+            (0..recv_routes.len()).map(|_| JitterBuffer::new(prime_packets)).collect();
+        // Packet-loss concealment state, per peer: the last decoded block and how
+        // many times we've repeated it.
+        let mut last_block: Vec<Option<(Vec<f32>, u8)>> = vec![None; recv_routes.len()];
+        let mut miss: Vec<u32> = vec![0; recv_routes.len()];
         let mut recv_buf     = vec![0u8; max_packet_len];
         let mut unknown_seen: HashSet<IpAddr> = HashSet::new();
-        let mut drain_tick   = tokio::time::interval(Duration::from_micros(packet_dur_us));
+        // Drain often relative to a packet so the refill loop tracks the device.
+        let mut drain_tick   = tokio::time::interval(Duration::from_micros(packet_dur_us / 2));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -267,37 +294,55 @@ pub async fn run(
                 }
 
                 _ = drain_tick.tick() => {
-                    let mut out_block = vec![0f32; out_n_samples];
-                    let mut any = false;
-
-                    for (ri, route) in recv_routes.iter().enumerate() {
-                        let jb = &mut jitters[ri];
-                        if !jb.primed {
-                            continue;
+                    // Refill the playout ring up to the target depth, draining a
+                    // block per iteration. Pacing by ring occupancy locks playout
+                    // to the audio device's clock (it only frees space as fast as
+                    // the DAC consumes) rather than to this software timer, and it
+                    // keeps the ring at a healthy level instead of near-empty.
+                    loop {
+                        let occupied = play_capacity - play_prod.vacant_len();
+                        if occupied >= target_samples || play_prod.vacant_len() < out_n_samples {
+                            break;
                         }
-                        any = true;
-                        if let Some((samples, src_ch)) = jb.drain_next() {
-                            let src_ch = src_ch as usize;
-                            for &(peer_ch, out_ch) in &route.recv {
-                                let pc = peer_ch as usize;
-                                let oc = out_ch as usize;
-                                if pc >= src_ch || oc >= out_ch_usize {
-                                    continue;
+
+                        let mut out_block = vec![0f32; out_n_samples];
+                        let mut produced = false;
+
+                        for (ri, route) in recv_routes.iter().enumerate() {
+                            if !jitters[ri].primed {
+                                continue;
+                            }
+                            match jitters[ri].drain_next() {
+                                Some((samples, src_ch)) => {
+                                    scatter(&mut out_block, &samples, src_ch as usize,
+                                            &route.recv, out_ch_usize, frames_usize, 1.0);
+                                    last_block[ri] = Some((samples, src_ch));
+                                    miss[ri] = 0;
+                                    produced = true;
                                 }
-                                for f in 0..frames_usize {
-                                    out_block[f * out_ch_usize + oc] += samples[f * src_ch + pc];
+                                None => {
+                                    // Lost/late packet: conceal by repeating the
+                                    // last block, fading, for a few packets.
+                                    if miss[ri] < PLC_MAX_REPEATS {
+                                        if let Some((samples, src_ch)) = &last_block[ri] {
+                                            let gain = PLC_DECAY.powi(miss[ri] as i32 + 1);
+                                            scatter(&mut out_block, samples, *src_ch as usize,
+                                                    &route.recv, out_ch_usize, frames_usize, gain);
+                                            miss[ri] += 1;
+                                            produced = true;
+                                            plc_c.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    // Nothing primed yet — hold off so playout starts cleanly.
-                    if !any {
-                        continue;
-                    }
-                    let written = play_prod.push_slice(&out_block);
-                    if written < out_block.len() {
-                        warn!("playout ring full — dropped {} samples", out_block.len() - written);
+                        // No primed peer had anything to play — stop refilling and
+                        // let the ring drain to silence rather than push zeros.
+                        if !produced {
+                            break;
+                        }
+                        play_prod.push_slice(&out_block);
                     }
                 }
             }
@@ -319,8 +364,9 @@ pub async fn run(
             let un = recv_unknown.load(Ordering::Relaxed);
             let bad = recv_bad.load(Ordering::Relaxed);
             let rs = resyncs.load(Ordering::Relaxed);
+            let pl = plc.load(Ordering::Relaxed);
             info!(
-                "stats — sent {s} (+{}/s) | recv ok {ok} (+{}/s), unknown-src {un}, bad {bad}, resyncs {rs}",
+                "stats — sent {s} (+{}/s) | recv ok {ok} (+{}/s), unknown-src {un}, bad {bad}, resyncs {rs}, plc {pl}",
                 s - prev_sent, ok - prev_ok
             );
             prev_sent = s;
@@ -339,4 +385,27 @@ pub async fn run(
     drop(output_stream);
 
     Ok(())
+}
+
+/// Mix one peer's interleaved block into the output block per its route map,
+/// scaled by `gain` (used to fade during packet-loss concealment).
+fn scatter(
+    out_block: &mut [f32],
+    samples: &[f32],
+    src_ch: usize,
+    recv: &[(u16, u16)],
+    out_ch: usize,
+    frames: usize,
+    gain: f32,
+) {
+    for &(peer_ch, dst_ch) in recv {
+        let pc = peer_ch as usize;
+        let oc = dst_ch as usize;
+        if pc >= src_ch || oc >= out_ch {
+            continue;
+        }
+        for f in 0..frames {
+            out_block[f * out_ch + oc] += samples[f * src_ch + pc] * gain;
+        }
+    }
 }
