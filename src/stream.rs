@@ -15,6 +15,7 @@ use crate::audio;
 use crate::config::Config;
 use crate::jitter::JitterBuffer;
 use crate::packet::AudioPacket;
+use crate::transport;
 
 /// Number of audio frames packed into each UDP packet.
 /// 64 frames @ 48 kHz = ~1.33 ms per packet.
@@ -23,9 +24,6 @@ const FRAMES_PER_PACKET: u8 = 64;
 /// Playout ring capacity in frames — covers ~170 ms at 48 kHz. Generous so the
 /// configurable target fill level (see `jitter_ms`) always fits.
 const RING_FRAMES: usize = 8192;
-
-/// Default playout buffer depth (ms) if not set in config.
-const DEFAULT_JITTER_MS: u16 = 40;
 
 /// On a missing packet, repeat the last block this many times (fading) before
 /// falling back to silence — masks isolated losses without obvious looping.
@@ -88,7 +86,7 @@ pub async fn run(
     // Playout buffer depth: how much audio we hold before playing. This is the
     // latency/stability trade-off knob. Express it both as a packet count (the
     // jitter-buffer prime) and as a frame target the drain loop keeps queued.
-    let jitter_ms = cfg.audio.jitter_ms.unwrap_or(DEFAULT_JITTER_MS).max(5);
+    let jitter_ms = cfg.audio.jitter_ms.unwrap_or(transport::DEFAULT_JITTER_MS).max(5);
     let target_frames = (jitter_ms as usize * sample_rate as usize / 1000)
         .min(RING_FRAMES - FRAMES_PER_PACKET as usize); // leave room for one block
     let prime_packets = (target_frames / FRAMES_PER_PACKET as usize).max(1);
@@ -201,21 +199,9 @@ pub async fn run(
             }
 
             for route in &send_routes {
-                let n_ch = route.send.len();
-                let mut samples = Vec::with_capacity(frames_usize * n_ch);
-                for f in 0..frames_usize {
-                    let base = f * in_ch_usize;
-                    for &ch in &route.send {
-                        samples.push(block[base + ch as usize]);
-                    }
-                }
-                let pkt = AudioPacket {
-                    seq,
-                    sample_rate: sample_rate as u16,
-                    channels: n_ch as u8,
-                    frames,
-                    samples,
-                };
+                let pkt = transport::packetize(
+                    &block, in_ch_usize, &route.send, frames, seq, sample_rate as u16,
+                );
                 let encoded = pkt.encode();
                 if let Err(e) = send_socket.send_to(&encoded, route.dest).await {
                     warn!("send → {} ({}): {e}", route.name, route.dest);
@@ -271,11 +257,11 @@ pub async fn run(
                         Ok((len, from)) => match ip_to_route.get(&from.ip()) {
                             Some(&ri) => match AudioPacket::decode(&recv_buf[..len]) {
                                 Some(pkt) => {
-                                    let was_primed = jitters[ri].primed;
-                                    if jitters[ri].insert(pkt) {
+                                    let out = transport::ingest(&mut jitters[ri], pkt);
+                                    if out.resynced {
                                         resyncs_c.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    if !was_primed && jitters[ri].primed {
+                                    if out.newly_primed {
                                         info!("peer {} primed — playing out", recv_routes[ri].name);
                                     }
                                     recv_ok_c.fetch_add(1, Ordering::Relaxed);

@@ -1,16 +1,34 @@
 # gorgon
 
-P2P audio and CV messenger over Tailscale. Send raw PCM audio between two ES-9 interfaces, or exchange OSC control-voltage messages, with no central server.
+P2P audio and CV messenger over Tailscale. Send raw PCM audio between two ES-9 interfaces, or exchange OSC control-voltage messages, with no central server. Or join a **group** and have each member's exposed signals appear as a native virtual audio device on everyone else's machine — see [Remote groups](#remote-groups).
 
 ## Requirements
 
-- [Rust](https://rustup.rs)
+- [Rust](https://rustup.rs) (2024 edition)
 - [Tailscale](https://tailscale.com) (for peer connectivity)
-- `libasound2-dev` (Linux, for ALSA audio)
+- A few system libraries (see below)
+
+### System dependencies
+
+Cargo fetches the Rust crates, but some **system** libraries must be present at build time. Install them with `make setup`, or by hand:
+
+**Linux** (Debian/Ubuntu) — ALSA for audio, plus PipeWire and clang for the `remote` virtual-device feature (the `pipewire` crate links `libpipewire-0.3` and runs `bindgen`, which needs clang):
 
 ```bash
-sudo apt-get install libasound2-dev
-cargo build --release
+sudo apt-get install build-essential pkg-config clang libasound2-dev libpipewire-0.3-dev
+# or: make setup
+```
+
+**macOS** — no build-time libraries (CoreAudio is part of the system). For the `remote` feature, install the [BlackHole](https://existential.audio/blackhole/) virtual audio driver:
+
+```bash
+brew install blackhole-16ch   # or: make setup
+```
+
+Then build:
+
+```bash
+cargo build --release   # or: make build
 ```
 
 ## Configuration
@@ -107,6 +125,43 @@ gorgon note bass 60
 
 OSC messages use the address scheme `/cv/<channel>`, `/gate/<channel>`, `/note/<channel>` and are compatible with VCV Rack's **cvosccv** module. Point cvosccv's output at your peer's Tailscale IP on port 9000.
 
+### Remote groups
+
+Instead of hand-wiring channel matrices, you can declare *named* signals and join a *group*. Every other member then shows up on your machine as a native virtual audio device — selectable in your DAW, VCV Rack, or any app.
+
+```toml
+device_name = "ryan-es9"     # how you appear as a device to others
+
+[[remote.outputs]]           # signals you send (sourced from your input jacks)
+name = "kick"
+channel = 0
+[[remote.outputs]]
+name = "bass"
+channel = 1
+
+[groups.modular-jam]         # static roster of member Tailscale IPs (list the others)
+members = ["100.x.x.x", "100.y.y.y"]
+```
+
+```bash
+gorgon remote modular-jam
+```
+
+Each machine broadcasts its device name and port list to the group every ~1.5 s, so members learn each other's layout automatically (and a member who restarts with a changed config is picked up within seconds). A peer named `alice-es9` exposing two outputs appears on your machine as a 2-channel recordable device `alice-es9`.
+
+**Platform support for the virtual device:**
+
+- **Linux** — created natively via PipeWire, no setup beyond `libpipewire-0.3-dev` at build time. Channels show as `AUX0, AUX1, …` in other apps; gorgon owns the real names and prints the `AUXn = name` mapping at startup.
+- **macOS** — gorgon binds to a pre-installed [BlackHole](https://existential.audio/blackhole/) device (install the 16-channel build; override the name with `[audio] mac_device = "BlackHole 16ch"` if needed). Since macOS can't mint a device per peer, gorgon multiplexes the whole group onto BlackHole's channels and **prints a channel map at startup** — e.g. "RECORD their outputs on BlackHole ch 0..2", "PLAY your outputs into BlackHole ch 8..10". You wire your DAW/VCV to those channels (record the low half, play into the high half — the two halves are kept separate so the loopback doesn't feed back). To use it alongside real hardware, make an Aggregate Device in Audio MIDI Setup. *(This path is new and verified to compile + unit-tested on Linux, but the live CoreAudio behavior should be confirmed on a Mac.)*
+
+`[[remote.inputs]]` close the loop: a peer playing into your device on their machine arrives and is summed onto your physical output channels (several peers mix). Any number of members can be in a group at once — each appears as its own device, and everyone's audio mixes where it overlaps.
+
+Because signals stay raw f32 PCM with PipeWire conversion/volume/mixing disabled, DC-coupled CV passes through the virtual device bit-for-bit, exactly like the direct `stream` path.
+
+> **Status:** Full-duplex with any number of members. Linux uses native PipeWire devices (per peer). macOS uses one BlackHole device with a printed channel map (new — pending live verification on a Mac). Still landing: automatic reconfiguration when you re-save your config (for now, restarting re-announces your layout).
+
 ## Latency
 
-Audio latency depends on network conditions and jitter buffer depth. Typical one-way latency over Tailscale between nearby machines is 20–50 ms. The jitter buffer primes with ~10 ms of packets before starting playback, trading a small fixed latency for dropout resilience.
+Audio latency depends on network conditions and the playout buffer depth. Typical one-way latency over Tailscale between nearby machines is 20–50 ms. Before starting playback, each peer's jitter buffer fills to a target depth, trading a small fixed latency for resilience to network jitter.
+
+Tune the depth with `jitter_ms` in the `[audio]` config section (default 40 ms): raise it (e.g. 80) if you hear glitches or dropouts, or lower it (e.g. 20) for tighter timing once the link is stable. The setting applies to both the `stream` and `remote` paths.
