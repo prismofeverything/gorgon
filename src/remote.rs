@@ -62,6 +62,7 @@ struct Member {
     // Flow 1 — peer's outputs → their SOURCE device on our machine.
     out_play: Playout,
     feed: Option<HeapProd<f32>>, // push drained audio here; None if peer has no outputs
+    source_width: usize,         // peer's output channel count (= feed-ring + packet width)
     _source: Option<VDevice>,
 
     // Flow 3 — local apps → peer's SINK device → drained and sent to the peer.
@@ -137,6 +138,11 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
     // Playout buffer depth (jitter-buffer prime) from `audio.jitter_ms` — the
     // same latency/stability knob the point-to-point `stream` path uses.
     let prime = transport::prime_packets(cfg.audio.jitter_ms, sample_rate, FRAMES_PER_PACKET);
+    // Target depth (frames) the drain loop keeps queued in each output ring — the
+    // occupancy set-point that paces playout to the device clock (see `refill`).
+    let target_frames = ((cfg.audio.jitter_ms.unwrap_or(transport::DEFAULT_JITTER_MS).max(5) as usize)
+        * sample_rate as usize / 1000)
+        .min(RING_FRAMES - FRAMES_PER_PACKET as usize);
     info!(
         "playout buffer: ~{prime} packets ({} ms target)",
         cfg.audio.jitter_ms.unwrap_or(transport::DEFAULT_JITTER_MS)
@@ -260,7 +266,9 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
 
     let mut ad_tick = tokio::time::interval(ADVERT_INTERVAL);
     let packet_dur_us = (FRAMES_PER_PACKET as u64 * 1_000_000) / sample_rate as u64;
-    let mut drain_tick = tokio::time::interval(Duration::from_micros(packet_dur_us));
+    // Tick at twice the packet rate so the occupancy-paced refill tracks the
+    // device's consumption closely (it pushes only as the ring frees space).
+    let mut drain_tick = tokio::time::interval(Duration::from_micros((packet_dur_us / 2).max(1)));
     drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stale_tick = tokio::time::interval(Duration::from_secs(1));
 
@@ -324,35 +332,35 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
             }
 
             _ = drain_tick.tick() => {
-                // (a) Flow 1: drain each peer's outputs into its source device.
+                // (a) Flow 1: keep each peer's source-device ring topped up to the
+                // target depth, paced by how fast that device drains it.
                 for member in roster.values_mut() {
-                    if let Some((samples, _)) = member.out_play.next_block() {
-                        if let Some(feed) = member.feed.as_mut() {
-                            let _ = feed.push_slice(&samples);
-                        }
+                    let Member { out_play, feed, source_width, .. } = member;
+                    if let Some(feed) = feed.as_mut() {
+                        let width = *source_width;
+                        refill(feed, target_frames * width, frames_usize * width, || {
+                            out_play.next_block().map(|(samples, _)| samples)
+                        });
                     }
                 }
 
-                // (b) Flow 4: sum peers' returns onto our physical outputs.
+                // (b) Flow 4: keep the physical-output ring topped up to the target
+                // depth with the peers' summed returns, paced by the output clock.
                 if let Some(pp) = play_prod.as_mut() {
-                    let mut out_block = vec![0f32; frames_usize * out_channels];
-                    let mut any = false;
-                    for member in roster.values_mut() {
-                        if member.return_play.primed() {
-                            any = true;
+                    let block_len = frames_usize * out_channels;
+                    refill(pp, target_frames * out_channels, block_len, || {
+                        let mut out_block = vec![0f32; block_len];
+                        let mut produced = false;
+                        for member in roster.values_mut() {
                             if let Some((samples, src_ch)) = member.return_play.next_block() {
                                 transport::sum_into_output(
                                     &mut out_block, &samples, src_ch as usize, out_channels, &my_in_pairs, frames_usize,
                                 );
+                                produced = true;
                             }
                         }
-                    }
-                    if any {
-                        let written = pp.push_slice(&out_block);
-                        if written < out_block.len() {
-                            warn!("playout ring full — dropped {} samples", out_block.len() - written);
-                        }
-                    }
+                        if produced { Some(out_block) } else { None }
+                    });
                 }
 
                 // (c) Flow 3: drain what local apps played into each peer's sink
@@ -483,6 +491,7 @@ fn handle_advertisement(
             device_name: ad.device_name,
             out_play: Playout::new(prime),
             feed,
+            source_width: n_out,
             _source: source,
             intake,
             _sink: sink,
@@ -528,6 +537,29 @@ fn hostname() -> String {
         String::from_utf8_lossy(&buf[..end]).into_owned()
     } else {
         "gorgon".to_string()
+    }
+}
+
+/// Top up an output ring toward `target_occ` samples, pushing whole
+/// `block_len`-sample blocks supplied by `next`. Pacing by the ring's occupancy
+/// locks our push rate to the device draining it — the device only frees space
+/// at the hardware clock, so the ring settles near `target_occ` instead of
+/// drifting full (drops) or empty (glitches) the way a free-running timer would.
+/// Stops at the target, when no whole block fits, or when `next` returns `None`
+/// (nothing primed, or the loss ran past the PLC window — let the ring drain).
+fn refill(
+    ring: &mut HeapProd<f32>,
+    target_occ: usize,
+    block_len: usize,
+    mut next: impl FnMut() -> Option<Vec<f32>>,
+) {
+    while ring.vacant_len() >= block_len && ring.occupied_len() < target_occ {
+        match next() {
+            Some(block) => {
+                ring.push_slice(&block);
+            }
+            None => break,
+        }
     }
 }
 
@@ -578,6 +610,11 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
     let mac_device = cfg.audio.mac_device.clone().unwrap_or_else(|| "BlackHole".to_string());
     // Playout buffer depth (jitter-buffer prime) from `audio.jitter_ms`; BlackHole runs at 48 kHz.
     let prime = transport::prime_packets(cfg.audio.jitter_ms, 48_000, FRAMES_PER_PACKET);
+    // Target depth (frames) the drain loop keeps queued in the BlackHole ring —
+    // the occupancy set-point that paces playout to the device clock (see `refill`).
+    let target_frames = ((cfg.audio.jitter_ms.unwrap_or(transport::DEFAULT_JITTER_MS).max(5) as usize)
+        * 48_000 / 1000)
+        .min(RING_FRAMES - FRAMES_PER_PACKET as usize);
 
     let member_set: HashSet<IpAddr> = group.members.iter().copied().collect();
     let out_dests: Vec<SocketAddr> = group
@@ -634,7 +671,7 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
 
     let mut ad_tick = tokio::time::interval(ADVERT_INTERVAL);
     let mut drain_tick =
-        tokio::time::interval(Duration::from_micros((FRAMES_PER_PACKET as u64 * 1_000_000) / 48_000));
+        tokio::time::interval(Duration::from_micros((FRAMES_PER_PACKET as u64 * 1_000_000) / 48_000 / 2));
     drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stale_tick = tokio::time::interval(Duration::from_secs(1));
 
@@ -697,32 +734,33 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
             }
 
             _ = drain_tick.tick() => {
-                // ---- Build one full-width frame the user records (flows 1 + 4) ----
-                let mut frame = vec![0f32; full];
-                for m in roster.values_mut() {
-                    if let Some((samples, _)) = m.out_play.next_block() {
-                        blackhole::place_lane(&mut frame, n, m.out_lane, m.out_width, &samples);
-                    }
-                }
-                if let Some(off) = my_in_lane {
-                    let mut mixed = vec![0f32; frames * n_in];
-                    let mut any = false;
+                // ---- Keep the BlackHole record ring topped up to the target depth
+                // with full-width frames (flows 1 + 4), paced by the device clock. ----
+                refill(&mut hub.to_device, target_frames * n, full, || {
+                    let mut frame = vec![0f32; full];
+                    let mut produced = false;
                     for m in roster.values_mut() {
-                        if m.return_play.primed() {
-                            any = true;
-                            if let Some((samples, src_ch)) = m.return_play.next_block() {
-                                transport::sum_into_output(&mut mixed, &samples, src_ch as usize, n_in, &my_in_pairs, frames);
-                            }
+                        if let Some((samples, _)) = m.out_play.next_block() {
+                            blackhole::place_lane(&mut frame, n, m.out_lane, m.out_width, &samples);
+                            produced = true;
                         }
                     }
-                    if any {
-                        blackhole::place_lane(&mut frame, n, off, n_in, &mixed);
+                    if let Some(off) = my_in_lane {
+                        let mut mixed = vec![0f32; frames * n_in];
+                        let mut mixed_any = false;
+                        for m in roster.values_mut() {
+                            if let Some((samples, src_ch)) = m.return_play.next_block() {
+                                transport::sum_into_output(&mut mixed, &samples, src_ch as usize, n_in, &my_in_pairs, frames);
+                                mixed_any = true;
+                            }
+                        }
+                        if mixed_any {
+                            blackhole::place_lane(&mut frame, n, off, n_in, &mixed);
+                            produced = true;
+                        }
                     }
-                }
-                let written = hub.to_device.push_slice(&frame);
-                if written < frame.len() {
-                    warn!("BlackHole output ring full — dropped {} samples", frame.len() - written);
-                }
+                    if produced { Some(frame) } else { None }
+                });
 
                 // ---- Read frames the user plays and send them on (flows 2 + 3) ----
                 while hub.from_device.occupied_len() >= full {

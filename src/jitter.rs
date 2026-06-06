@@ -116,11 +116,6 @@ impl Playout {
         Self { jb: JitterBuffer::new(prime), last: None, miss: 0 }
     }
 
-    /// Whether the buffer has filled its prime cushion and is playing out.
-    pub fn primed(&self) -> bool {
-        self.jb.primed
-    }
-
     /// Insert a decoded packet; returns `true` if this packet just primed the
     /// buffer for the first time (so the caller can log the transition).
     pub fn insert(&mut self, pkt: AudioPacket) -> bool {
@@ -221,9 +216,8 @@ mod tests {
         for s in 0..PRIME {
             p.insert(pkt(s));
         }
-        assert!(p.primed());
 
-        // The primed packets play out in order at full gain.
+        // Priming done (next_block yields Some); the packets play out in order at full gain.
         for s in 0..PRIME {
             let (samples, _) = p.next_block().expect("primed buffer plays out");
             assert_eq!(samples[0], s as f32);
