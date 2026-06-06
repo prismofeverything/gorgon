@@ -1,8 +1,7 @@
 //! Audio-transport helpers shared by the point-to-point `stream` command and
-//! the group `remote` command: turning a captured block into a wire packet,
-//! and feeding decoded packets into a jitter buffer with prime/resync tracking.
+//! the group `remote` command: turning a captured block into a wire packet, and
+//! mixing a drained packet into an interleaved output buffer.
 
-use crate::jitter::JitterBuffer;
 use crate::packet::AudioPacket;
 
 /// Re-interleave a captured block into a packet carrying only `channels` (the
@@ -30,26 +29,6 @@ pub fn packetize(
         channels: channels.len() as u8,
         frames,
         samples,
-    }
-}
-
-/// What happened when a packet was inserted into a jitter buffer — surfaced so
-/// the caller can bump its own counters and log the prime transition.
-pub struct IngestOutcome {
-    /// The buffer resynced to this packet (a stall, loss burst, or peer restart).
-    pub resynced: bool,
-    /// This packet pushed the buffer over the prime threshold for the first time.
-    pub newly_primed: bool,
-}
-
-/// Insert a decoded packet into a jitter buffer, reporting the resync and
-/// prime-transition events the caller cares about.
-pub fn ingest(jb: &mut JitterBuffer, pkt: AudioPacket) -> IngestOutcome {
-    let was_primed = jb.primed;
-    let resynced = jb.insert(pkt);
-    IngestOutcome {
-        resynced,
-        newly_primed: !was_primed && jb.primed,
     }
 }
 

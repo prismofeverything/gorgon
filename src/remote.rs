@@ -36,7 +36,7 @@ use tracing::{info, warn};
 use crate::audio;
 use crate::blackhole;
 use crate::config::{Config, ExposedPort};
-use crate::jitter::Playout;
+use crate::resample::Resampler;
 use crate::network;
 use crate::osc_msg::{self, Advertisement};
 use crate::packet::AudioPacket;
@@ -60,7 +60,7 @@ struct Member {
     device_name: String,
 
     // Flow 1 — peer's outputs → their SOURCE device on our machine.
-    out_play: Playout,
+    out_play: Resampler,
     feed: Option<HeapProd<f32>>, // push drained audio here; None if peer has no outputs
     source_width: usize,         // peer's output channel count (= feed-ring + packet width)
     _source: Option<VDevice>,
@@ -72,7 +72,7 @@ struct Member {
     in_seq: u32,
 
     // Flow 4 — peer playing into OUR inputs → summed onto our physical outputs.
-    return_play: Playout,
+    return_play: Resampler,
 
     last_seen: Instant,
 }
@@ -299,7 +299,7 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                 if let Ok((len, from)) = r {
                     if let Ok((_, packet)) = rosc::decoder::decode_udp(&osc_buf[..len]) {
                         if let Some(ad) = osc_msg::parse_advertisement(&packet) {
-                            handle_advertisement(&mut roster, ad, from.ip(), group_name, node_id, &member_set, prime);
+                            handle_advertisement(&mut roster, ad, from.ip(), group_name, node_id, &member_set, prime, sample_rate);
                         }
                     }
                 }
@@ -310,7 +310,7 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                 if let Ok((len, from)) = r {
                     if let Some(member) = roster.get_mut(&from.ip()) {
                         if let Some(pkt) = AudioPacket::decode(&out_buf[..len]) {
-                            if member.out_play.insert(pkt) {
+                            if member.out_play.insert(pkt).newly_primed {
                                 info!("member '{}' outputs primed", member.device_name);
                             }
                         }
@@ -339,7 +339,7 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                     if let Some(feed) = feed.as_mut() {
                         let width = *source_width;
                         refill(feed, target_frames * width, frames_usize * width, || {
-                            out_play.next_block().map(|(samples, _)| samples)
+                            out_play.produce_block().map(|(samples, _)| samples)
                         });
                     }
                 }
@@ -352,7 +352,7 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                         let mut out_block = vec![0f32; block_len];
                         let mut produced = false;
                         for member in roster.values_mut() {
-                            if let Some((samples, src_ch)) = member.return_play.next_block() {
+                            if let Some((samples, src_ch)) = member.return_play.produce_block() {
                                 transport::sum_into_output(
                                     &mut out_block, &samples, src_ch as usize, out_channels, &my_in_pairs, frames_usize,
                                 );
@@ -429,6 +429,7 @@ fn handle_advertisement(
     my_node_id: u128,
     member_set: &HashSet<IpAddr>,
     prime: usize,
+    sample_rate: u32,
 ) {
     if ad.group != group_name || ad.node_id == my_node_id || !member_set.contains(&src_ip) {
         return;
@@ -489,7 +490,7 @@ fn handle_advertisement(
         Member {
             node_id: ad.node_id,
             device_name: ad.device_name,
-            out_play: Playout::new(prime),
+            out_play: Resampler::new(prime, sample_rate, FRAMES_PER_PACKET),
             feed,
             source_width: n_out,
             _source: source,
@@ -497,7 +498,7 @@ fn handle_advertisement(
             _sink: sink,
             peer_inputs: n_in,
             in_seq: 0,
-            return_play: Playout::new(prime),
+            return_play: Resampler::new(prime, sample_rate, FRAMES_PER_PACKET),
             last_seen: Instant::now(),
         },
     );
@@ -582,12 +583,12 @@ struct MacMember {
     device_name: String,
     /// Flow 1 — peer's outputs; drained and written to the `out_lane` channels
     /// (which the user records).
-    out_play: Playout,
+    out_play: Resampler,
     out_lane: usize,
     out_width: usize,
     /// Flow 4 — peer playing into our inputs; summed (with other peers) onto our
     /// own inputs' write-lane.
-    return_play: Playout,
+    return_play: Resampler,
     /// Flow 3 — what the user plays into this peer (read from `in_lane`), sent on.
     in_lane: usize,
     in_width: usize,
@@ -701,7 +702,7 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                 if let Ok((len, from)) = r {
                     if let Ok((_, packet)) = rosc::decoder::decode_udp(&osc_buf[..len]) {
                         if let Some(ad) = osc_msg::parse_advertisement(&packet) {
-                            handle_advertisement_macos(&mut roster, &mut chans, ad, from.ip(), group_name, node_id, &member_set, prime);
+                            handle_advertisement_macos(&mut roster, &mut chans, ad, from.ip(), group_name, node_id, &member_set, prime, 48_000);
                         }
                     }
                 }
@@ -712,7 +713,7 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                 if let Ok((len, from)) = r {
                     if let Some(m) = roster.get_mut(&from.ip()) {
                         if let Some(pkt) = AudioPacket::decode(&out_buf[..len]) {
-                            if m.out_play.insert(pkt) {
+                            if m.out_play.insert(pkt).newly_primed {
                                 info!("member '{}' outputs primed", m.device_name);
                             }
                         }
@@ -740,7 +741,7 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                     let mut frame = vec![0f32; full];
                     let mut produced = false;
                     for m in roster.values_mut() {
-                        if let Some((samples, _)) = m.out_play.next_block() {
+                        if let Some((samples, _)) = m.out_play.produce_block() {
                             blackhole::place_lane(&mut frame, n, m.out_lane, m.out_width, &samples);
                             produced = true;
                         }
@@ -749,7 +750,7 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                         let mut mixed = vec![0f32; frames * n_in];
                         let mut mixed_any = false;
                         for m in roster.values_mut() {
-                            if let Some((samples, src_ch)) = m.return_play.next_block() {
+                            if let Some((samples, src_ch)) = m.return_play.produce_block() {
                                 transport::sum_into_output(&mut mixed, &samples, src_ch as usize, n_in, &my_in_pairs, frames);
                                 mixed_any = true;
                             }
@@ -828,6 +829,7 @@ fn handle_advertisement_macos(
     my_node_id: u128,
     member_set: &HashSet<IpAddr>,
     prime: usize,
+    sample_rate: u32,
 ) {
     if ad.group != group_name || ad.node_id == my_node_id || !member_set.contains(&src_ip) {
         return;
@@ -841,8 +843,8 @@ fn handle_advertisement_macos(
         // Restart: reuse the existing lanes, reset stream state.
         existing.node_id = ad.node_id;
         existing.device_name = ad.device_name;
-        existing.out_play = Playout::new(prime);
-        existing.return_play = Playout::new(prime);
+        existing.out_play = Resampler::new(prime, sample_rate, FRAMES_PER_PACKET);
+        existing.return_play = Resampler::new(prime, sample_rate, FRAMES_PER_PACKET);
         existing.in_seq = 0;
         existing.last_seen = Instant::now();
         return;
@@ -888,10 +890,10 @@ fn handle_advertisement_macos(
         MacMember {
             node_id: ad.node_id,
             device_name: ad.device_name,
-            out_play: Playout::new(prime),
+            out_play: Resampler::new(prime, sample_rate, FRAMES_PER_PACKET),
             out_lane,
             out_width: n_out,
-            return_play: Playout::new(prime),
+            return_play: Resampler::new(prime, sample_rate, FRAMES_PER_PACKET),
             in_lane,
             in_width: n_in,
             in_seq: 0,

@@ -93,6 +93,12 @@ impl JitterBuffer {
         self.read_seq = self.read_seq.wrapping_add(1);
         result
     }
+
+    /// Packets currently buffered (occupied slots) — the input-fill signal the
+    /// adaptive resampler holds steady to cancel clock drift.
+    pub fn filled_packets(&self) -> usize {
+        self.filled
+    }
 }
 
 /// On a missing packet, repeat the last block this many times (fading) before
@@ -100,6 +106,15 @@ impl JitterBuffer {
 pub const PLC_MAX_REPEATS: u32 = 3;
 /// Per-repeat amplitude decay applied during packet-loss concealment.
 pub const PLC_DECAY: f32 = 0.6;
+
+/// What inserting a packet did — surfaced so callers can bump counters and log
+/// the prime/resync transitions (and so the resampler can reset on re-prime).
+pub struct Ingest {
+    /// This packet pushed the buffer over the prime threshold for the first time.
+    pub newly_primed: bool,
+    /// The buffer resynced (a stall, loss burst, or peer restart).
+    pub resynced: bool,
+}
 
 /// A jitter buffer plus packet-loss-concealment (PLC) state. On a missing packet
 /// it replays the last decoded block, fading, for up to `PLC_MAX_REPEATS` packets
@@ -116,12 +131,22 @@ impl Playout {
         Self { jb: JitterBuffer::new(prime), last: None, miss: 0 }
     }
 
-    /// Insert a decoded packet; returns `true` if this packet just primed the
-    /// buffer for the first time (so the caller can log the transition).
-    pub fn insert(&mut self, pkt: AudioPacket) -> bool {
+    /// Insert a decoded packet, reporting the prime/resync transitions callers
+    /// care about (logging, stats, and the resampler's reset-on-reprime).
+    pub fn insert(&mut self, pkt: AudioPacket) -> Ingest {
         let was_primed = self.jb.primed;
-        self.jb.insert(pkt);
-        !was_primed && self.jb.primed
+        let resynced = self.jb.insert(pkt);
+        Ingest { newly_primed: !was_primed && self.jb.primed, resynced }
+    }
+
+    /// Whether the buffer has filled its prime cushion and is playing out.
+    pub fn primed(&self) -> bool {
+        self.jb.primed
+    }
+
+    /// Packets currently buffered — the resampler's drift signal.
+    pub fn buffered_packets(&self) -> usize {
+        self.jb.filled_packets()
     }
 
     /// The next block to play this tick: the freshly drained packet (full gain),

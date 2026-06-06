@@ -165,3 +165,7 @@ Because signals stay raw f32 PCM with PipeWire conversion/volume/mixing disabled
 Audio latency depends on network conditions and the playout buffer depth. Typical one-way latency over Tailscale between nearby machines is 20–50 ms. Before starting playback, each peer's jitter buffer fills to a target depth, trading a small fixed latency for resilience to network jitter.
 
 Tune the depth with `jitter_ms` in the `[audio]` config section (default 40 ms): raise it (e.g. 80) if you hear glitches or dropouts, or lower it (e.g. 20) for tighter timing once the link is stable. The setting applies to both the `stream` and `remote` paths.
+
+### Clock drift
+
+The two machines' sound cards run on independent crystals, so their sample rates drift ~100 ppm apart — with a fixed buffer that slowly fills or empties until an audible resync every few minutes. gorgon cancels it: each peer's stream is continuously resampled by a ratio steered by a control loop (a DLL) on the buffer fill, locking playout to your local clock. The correction is gentle (well under a cent of pitch, moving far too slowly to hear) and DC-preserving, so control voltages stay faithful; it converges within a minute or two of starting, and the jitter buffer's resync covers anything before it locks. Applies to both `stream` and `remote`.

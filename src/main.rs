@@ -6,6 +6,7 @@ mod network;
 mod osc_msg;
 mod packet;
 mod remote;
+mod resample;
 mod stream;
 mod transport;
 mod vdev;

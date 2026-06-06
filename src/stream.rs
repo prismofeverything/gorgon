@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use crate::audio;
 use crate::config::Config;
-use crate::jitter::{JitterBuffer, PLC_DECAY, PLC_MAX_REPEATS};
+use crate::resample::Resampler;
 use crate::packet::AudioPacket;
 use crate::transport;
 
@@ -168,7 +168,6 @@ pub async fn run(
     let recv_unknown = Arc::new(AtomicU64::new(0));
     let recv_bad     = Arc::new(AtomicU64::new(0));
     let resyncs      = Arc::new(AtomicU64::new(0));
-    let plc          = Arc::new(AtomicU64::new(0));
 
     let send_socket  = Arc::clone(&socket);
     let send_routes  = routes.clone();
@@ -219,7 +218,6 @@ pub async fn run(
     let recv_unknown_c = Arc::clone(&recv_unknown);
     let recv_bad_c     = Arc::clone(&recv_bad);
     let resyncs_c      = Arc::clone(&resyncs);
-    let plc_c          = Arc::clone(&plc);
     let out_ch_usize   = out_channels as usize;
     let out_n_samples  = frames_usize * out_ch_usize;
     let packet_dur_us  = (frames as u64 * 1_000_000) / sample_rate as u64;
@@ -232,12 +230,9 @@ pub async fn run(
 
     let recv_task = tokio::spawn(async move {
         let mut play_prod = play_prod;
-        let mut jitters: Vec<JitterBuffer> =
-            (0..recv_routes.len()).map(|_| JitterBuffer::new(prime_packets)).collect();
-        // Packet-loss concealment state, per peer: the last decoded block and how
-        // many times we've repeated it.
-        let mut last_block: Vec<Option<(Vec<f32>, u8)>> = vec![None; recv_routes.len()];
-        let mut miss: Vec<u32> = vec![0; recv_routes.len()];
+        let mut resamplers: Vec<Resampler> = (0..recv_routes.len())
+            .map(|_| Resampler::new(prime_packets, sample_rate, FRAMES_PER_PACKET))
+            .collect();
         let mut recv_buf     = vec![0u8; max_packet_len];
         let mut unknown_seen: HashSet<IpAddr> = HashSet::new();
         // Drain often relative to a packet so the refill loop tracks the device.
@@ -251,7 +246,7 @@ pub async fn run(
                         Ok((len, from)) => match ip_to_route.get(&from.ip()) {
                             Some(&ri) => match AudioPacket::decode(&recv_buf[..len]) {
                                 Some(pkt) => {
-                                    let out = transport::ingest(&mut jitters[ri], pkt);
+                                    let out = resamplers[ri].insert(pkt);
                                     if out.resynced {
                                         resyncs_c.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -289,31 +284,12 @@ pub async fn run(
                         let mut produced = false;
 
                         for (ri, route) in recv_routes.iter().enumerate() {
-                            if !jitters[ri].primed {
-                                continue;
-                            }
-                            match jitters[ri].drain_next() {
-                                Some((samples, src_ch)) => {
-                                    scatter(&mut out_block, &samples, src_ch as usize,
-                                            &route.recv, out_ch_usize, frames_usize, 1.0);
-                                    last_block[ri] = Some((samples, src_ch));
-                                    miss[ri] = 0;
-                                    produced = true;
-                                }
-                                None => {
-                                    // Lost/late packet: conceal by repeating the
-                                    // last block, fading, for a few packets.
-                                    if miss[ri] < PLC_MAX_REPEATS {
-                                        if let Some((samples, src_ch)) = &last_block[ri] {
-                                            let gain = PLC_DECAY.powi(miss[ri] as i32 + 1);
-                                            scatter(&mut out_block, samples, *src_ch as usize,
-                                                    &route.recv, out_ch_usize, frames_usize, gain);
-                                            miss[ri] += 1;
-                                            produced = true;
-                                            plc_c.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    }
-                                }
+                            if let Some((samples, src_ch)) = resamplers[ri].produce_block() {
+                                transport::sum_into_output(
+                                    &mut out_block, &samples, src_ch as usize,
+                                    out_ch_usize, &route.recv, frames_usize,
+                                );
+                                produced = true;
                             }
                         }
 
@@ -344,9 +320,8 @@ pub async fn run(
             let un = recv_unknown.load(Ordering::Relaxed);
             let bad = recv_bad.load(Ordering::Relaxed);
             let rs = resyncs.load(Ordering::Relaxed);
-            let pl = plc.load(Ordering::Relaxed);
             info!(
-                "stats — sent {s} (+{}/s) | recv ok {ok} (+{}/s), unknown-src {un}, bad {bad}, resyncs {rs}, plc {pl}",
+                "stats — sent {s} (+{}/s) | recv ok {ok} (+{}/s), unknown-src {un}, bad {bad}, resyncs {rs}",
                 s - prev_sent, ok - prev_ok
             );
             prev_sent = s;
@@ -365,27 +340,4 @@ pub async fn run(
     drop(output_stream);
 
     Ok(())
-}
-
-/// Mix one peer's interleaved block into the output block per its route map,
-/// scaled by `gain` (used to fade during packet-loss concealment).
-fn scatter(
-    out_block: &mut [f32],
-    samples: &[f32],
-    src_ch: usize,
-    recv: &[(u16, u16)],
-    out_ch: usize,
-    frames: usize,
-    gain: f32,
-) {
-    for &(peer_ch, dst_ch) in recv {
-        let pc = peer_ch as usize;
-        let oc = dst_ch as usize;
-        if pc >= src_ch || oc >= out_ch {
-            continue;
-        }
-        for f in 0..frames {
-            out_block[f * out_ch + oc] += samples[f * src_ch + pc] * gain;
-        }
-    }
 }
