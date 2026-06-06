@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use crate::audio;
 use crate::config::Config;
-use crate::jitter::JitterBuffer;
+use crate::jitter::{JitterBuffer, PLC_DECAY, PLC_MAX_REPEATS};
 use crate::packet::AudioPacket;
 use crate::transport;
 
@@ -24,12 +24,6 @@ const FRAMES_PER_PACKET: u8 = 64;
 /// Playout ring capacity in frames — covers ~170 ms at 48 kHz. Generous so the
 /// configurable target fill level (see `jitter_ms`) always fits.
 const RING_FRAMES: usize = 8192;
-
-/// On a missing packet, repeat the last block this many times (fading) before
-/// falling back to silence — masks isolated losses without obvious looping.
-const PLC_MAX_REPEATS: u32 = 3;
-/// Per-repeat amplitude decay applied during packet-loss concealment.
-const PLC_DECAY: f32 = 0.6;
 
 /// A resolved per-peer audio route.
 #[derive(Clone)]

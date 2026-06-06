@@ -36,7 +36,7 @@ use tracing::{info, warn};
 use crate::audio;
 use crate::blackhole;
 use crate::config::{Config, ExposedPort};
-use crate::jitter::JitterBuffer;
+use crate::jitter::Playout;
 use crate::network;
 use crate::osc_msg::{self, Advertisement};
 use crate::packet::AudioPacket;
@@ -60,7 +60,7 @@ struct Member {
     device_name: String,
 
     // Flow 1 — peer's outputs → their SOURCE device on our machine.
-    out_jitter: JitterBuffer,
+    out_play: Playout,
     feed: Option<HeapProd<f32>>, // push drained audio here; None if peer has no outputs
     _source: Option<VDevice>,
 
@@ -71,7 +71,7 @@ struct Member {
     in_seq: u32,
 
     // Flow 4 — peer playing into OUR inputs → summed onto our physical outputs.
-    return_jitter: JitterBuffer,
+    return_play: Playout,
 
     last_seen: Instant,
 }
@@ -302,7 +302,7 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                 if let Ok((len, from)) = r {
                     if let Some(member) = roster.get_mut(&from.ip()) {
                         if let Some(pkt) = AudioPacket::decode(&out_buf[..len]) {
-                            if transport::ingest(&mut member.out_jitter, pkt).newly_primed {
+                            if member.out_play.insert(pkt) {
                                 info!("member '{}' outputs primed", member.device_name);
                             }
                         }
@@ -316,7 +316,7 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                     if accept_inputs {
                         if let Some(member) = roster.get_mut(&from.ip()) {
                             if let Some(pkt) = AudioPacket::decode(&in_buf[..len]) {
-                                transport::ingest(&mut member.return_jitter, pkt);
+                                member.return_play.insert(pkt);
                             }
                         }
                     }
@@ -326,11 +326,9 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
             _ = drain_tick.tick() => {
                 // (a) Flow 1: drain each peer's outputs into its source device.
                 for member in roster.values_mut() {
-                    if member.out_jitter.primed {
-                        if let Some((samples, _)) = member.out_jitter.drain_next() {
-                            if let Some(feed) = member.feed.as_mut() {
-                                let _ = feed.push_slice(&samples);
-                            }
+                    if let Some((samples, _)) = member.out_play.next_block() {
+                        if let Some(feed) = member.feed.as_mut() {
+                            let _ = feed.push_slice(&samples);
                         }
                     }
                 }
@@ -340,9 +338,9 @@ async fn run_linux(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                     let mut out_block = vec![0f32; frames_usize * out_channels];
                     let mut any = false;
                     for member in roster.values_mut() {
-                        if member.return_jitter.primed {
+                        if member.return_play.primed() {
                             any = true;
-                            if let Some((samples, src_ch)) = member.return_jitter.drain_next() {
+                            if let Some((samples, src_ch)) = member.return_play.next_block() {
                                 transport::sum_into_output(
                                     &mut out_block, &samples, src_ch as usize, out_channels, &my_in_pairs, frames_usize,
                                 );
@@ -483,14 +481,14 @@ fn handle_advertisement(
         Member {
             node_id: ad.node_id,
             device_name: ad.device_name,
-            out_jitter: JitterBuffer::new(prime),
+            out_play: Playout::new(prime),
             feed,
             _source: source,
             intake,
             _sink: sink,
             peer_inputs: n_in,
             in_seq: 0,
-            return_jitter: JitterBuffer::new(prime),
+            return_play: Playout::new(prime),
             last_seen: Instant::now(),
         },
     );
@@ -552,12 +550,12 @@ struct MacMember {
     device_name: String,
     /// Flow 1 — peer's outputs; drained and written to the `out_lane` channels
     /// (which the user records).
-    out_jitter: JitterBuffer,
+    out_play: Playout,
     out_lane: usize,
     out_width: usize,
     /// Flow 4 — peer playing into our inputs; summed (with other peers) onto our
     /// own inputs' write-lane.
-    return_jitter: JitterBuffer,
+    return_play: Playout,
     /// Flow 3 — what the user plays into this peer (read from `in_lane`), sent on.
     in_lane: usize,
     in_width: usize,
@@ -677,7 +675,7 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                 if let Ok((len, from)) = r {
                     if let Some(m) = roster.get_mut(&from.ip()) {
                         if let Some(pkt) = AudioPacket::decode(&out_buf[..len]) {
-                            if transport::ingest(&mut m.out_jitter, pkt).newly_primed {
+                            if m.out_play.insert(pkt) {
                                 info!("member '{}' outputs primed", m.device_name);
                             }
                         }
@@ -691,7 +689,7 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                     if my_in_lane.is_some() {
                         if let Some(m) = roster.get_mut(&from.ip()) {
                             if let Some(pkt) = AudioPacket::decode(&in_buf[..len]) {
-                                transport::ingest(&mut m.return_jitter, pkt);
+                                m.return_play.insert(pkt);
                             }
                         }
                     }
@@ -702,19 +700,17 @@ async fn run_macos(cfg: &Config, group_name: &str, osc_socket: Arc<UdpSocket>) -
                 // ---- Build one full-width frame the user records (flows 1 + 4) ----
                 let mut frame = vec![0f32; full];
                 for m in roster.values_mut() {
-                    if m.out_jitter.primed {
-                        if let Some((samples, _)) = m.out_jitter.drain_next() {
-                            blackhole::place_lane(&mut frame, n, m.out_lane, m.out_width, &samples);
-                        }
+                    if let Some((samples, _)) = m.out_play.next_block() {
+                        blackhole::place_lane(&mut frame, n, m.out_lane, m.out_width, &samples);
                     }
                 }
                 if let Some(off) = my_in_lane {
                     let mut mixed = vec![0f32; frames * n_in];
                     let mut any = false;
                     for m in roster.values_mut() {
-                        if m.return_jitter.primed {
+                        if m.return_play.primed() {
                             any = true;
-                            if let Some((samples, src_ch)) = m.return_jitter.drain_next() {
+                            if let Some((samples, src_ch)) = m.return_play.next_block() {
                                 transport::sum_into_output(&mut mixed, &samples, src_ch as usize, n_in, &my_in_pairs, frames);
                             }
                         }
@@ -807,8 +803,8 @@ fn handle_advertisement_macos(
         // Restart: reuse the existing lanes, reset stream state.
         existing.node_id = ad.node_id;
         existing.device_name = ad.device_name;
-        existing.out_jitter = JitterBuffer::new(prime);
-        existing.return_jitter = JitterBuffer::new(prime);
+        existing.out_play = Playout::new(prime);
+        existing.return_play = Playout::new(prime);
         existing.in_seq = 0;
         existing.last_seen = Instant::now();
         return;
@@ -854,10 +850,10 @@ fn handle_advertisement_macos(
         MacMember {
             node_id: ad.node_id,
             device_name: ad.device_name,
-            out_jitter: JitterBuffer::new(prime),
+            out_play: Playout::new(prime),
             out_lane,
             out_width: n_out,
-            return_jitter: JitterBuffer::new(prime),
+            return_play: Playout::new(prime),
             in_lane,
             in_width: n_in,
             in_seq: 0,
