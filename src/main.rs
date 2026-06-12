@@ -1,15 +1,7 @@
-mod audio;
-mod blackhole;
-mod config;
-mod jitter;
-mod network;
-mod osc_msg;
-mod packet;
-mod remote;
-mod resample;
-mod stream;
-mod transport;
-mod vdev;
+//! The `gorgon` binary — a thin CLI shell over the `gorgon` library
+//! (`src/lib.rs`). All the realtime audio / CV / network logic lives in the
+//! library modules; this file is just argument parsing + command dispatch.
+use gorgon::{audio, config, network, osc_msg, remote, stream};
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
